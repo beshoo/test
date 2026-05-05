@@ -143,7 +143,8 @@ void CloseAll()
             else
                closePrice = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
 
-            OrderClose(OrderTicket(), OrderLots(), closePrice, 3);
+            bool closed = OrderClose(OrderTicket(), OrderLots(), closePrice, 3);
+            if(!closed) Print("OrderClose failed: ", GetLastError());
          }
       }
    }
@@ -171,8 +172,8 @@ double GetLastPositionPoints()
       }
    }
 
-   if(lastTicket == 0)                                    return 0;
-   if(!OrderSelect(lastTicket, SELECT_BY_TICKET))         return 0;
+   if(lastTicket == 0)                            return 0;
+   if(!OrderSelect(lastTicket, SELECT_BY_TICKET)) return 0;
 
    int    type  = OrderType();
    double open  = OrderOpenPrice();
@@ -204,10 +205,10 @@ void CheckLastTradeClose()
 //+------------------------------------------------------------------+
 void CheckEntry()
 {
-   if(!IsSpreadOK())              return;
+   if(!IsSpreadOK())                    return;
    if(CountPositions() >= MaxPositions) return;
-   if(CountPositions() > 0)       return;
-   if(!IsADXStrong())             return;
+   if(CountPositions() > 0)             return;
+   if(!IsADXStrong())                   return;
 
    double close1 = iClose(InpSymbol, InpTimeframe, 1);
    double close2 = iClose(InpSymbol, InpTimeframe, 2);
@@ -223,17 +224,15 @@ void CheckEntry()
    double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
 
+   int ticket = -1;
+
    if(close1 > ema)
    {
       if((prevBullish && close1 > close2) ||
          (prevBearish && close1 > high2))
       {
-         int ticket = OrderSend(InpSymbol, OP_BUY, InpStartLot, ask, 3, 0, 0, "", 0, 0, clrGreen);
-         if(ticket > 0)
-         {
-            direction = 1;
-            lastLot   = InpStartLot;
-         }
+         ticket = OrderSend(InpSymbol, OP_BUY, InpStartLot, ask, 3, 0, 0, "", 0, 0, clrGreen);
+         if(ticket > 0) { direction = 1; lastLot = InpStartLot; }
          return;
       }
    }
@@ -243,12 +242,8 @@ void CheckEntry()
       if((prevBearish && close1 < close2) ||
          (prevBullish && close1 < low2))
       {
-         int ticket = OrderSend(InpSymbol, OP_SELL, InpStartLot, bid, 3, 0, 0, "", 0, 0, clrRed);
-         if(ticket > 0)
-         {
-            direction = -1;
-            lastLot   = InpStartLot;
-         }
+         ticket = OrderSend(InpSymbol, OP_SELL, InpStartLot, bid, 3, 0, 0, "", 0, 0, clrRed);
+         if(ticket > 0) { direction = -1; lastLot = InpStartLot; }
          return;
       }
    }
@@ -307,12 +302,13 @@ void ManageGrid()
       double askPrice = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
       double bidPrice = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
 
+      int result = -1;
       if(actualDirection == 1)
-         OrderSend(InpSymbol, OP_BUY,  newLot, askPrice, 3, 0, 0, "", 0, 0, clrGreen);
+         result = OrderSend(InpSymbol, OP_BUY,  newLot, askPrice, 3, 0, 0, "", 0, 0, clrGreen);
       else if(actualDirection == -1)
-         OrderSend(InpSymbol, OP_SELL, newLot, bidPrice, 3, 0, 0, "", 0, 0, clrRed);
+         result = OrderSend(InpSymbol, OP_SELL, newLot, bidPrice, 3, 0, 0, "", 0, 0, clrRed);
 
-      lastLot = newLot;
+      if(result > 0) lastLot = newLot;
    }
 }
 
