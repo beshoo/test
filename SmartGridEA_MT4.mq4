@@ -284,8 +284,9 @@ void ManageGrid()
    if(lastTicket == 0)                            return;
    if(!OrderSelect(lastTicket, SELECT_BY_TICKET)) return;
 
-   int    type = OrderType();
-   double open = OrderOpenPrice();
+   int    type    = OrderType();
+   double open    = OrderOpenPrice();
+   double lotSize = OrderLots(); // always read actual lot from the order
 
    double price = (type == OP_BUY) ?
                   SymbolInfoDouble(InpSymbol, SYMBOL_BID) :
@@ -295,9 +296,9 @@ void ManageGrid()
 
    if(distance >= InpStepPoints)
    {
-      double newLot = lastLot * 2.0;
-      if(newLot > InpMaxLot)  newLot = InpMaxLot;
-      if(newLot <= lastLot)   return;
+      double newLot = lotSize * 2.0; // 0.01 -> 0.02 -> 0.04 -> 0.08
+      if(newLot > InpMaxLot) newLot = InpMaxLot;
+      if(newLot <= lotSize)  return; // already at max lot, don't repeat
 
       double askPrice = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
       double bidPrice = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
