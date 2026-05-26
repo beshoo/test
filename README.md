@@ -37,6 +37,8 @@ if ($rapidFraction !== null && $rapidFraction > 0 && $rapidFraction < 1) {
 
 The effective-ICR / effective-ISF grossing for mix is defined in `Config.csv` rows 125–126 (`Effective ICR/ISF for dosing`) using the same rapid-fraction `VLOOKUP`. The carb dose (`bolus_carbs_dose`) is computed as `carbs / periodIcr` and the mix scaling is expected to come through the **effective ICR** rather than a second division — confirm the period ICR passed in is already the effective (grossed) one before relying on this in reconciliation math.
 
+> ⚠️ **CORRECTION (verified 2026-05-26 — see §7 Audit Findings):** the assumption above is FALSE in the current code. The effective ICR/ISF (Config rows 125–126) is **not implemented anywhere in PHP** — nothing reads it. The carb dose stays `carbs / periodIcr` with **no** rapid-fraction grossing, while `correction_dose` and `delta_units` ARE divided by `rf`. The result is that mix meal totals are wrong today (the user's own 2.8 U ⇒ 50/50 should be 5.6 U; the code produces ≈3.47 U). **This must be fixed (§7 C1) before any reconciliation math sums `total_dose_with_iob`.**
+
 ### 1.2 Basal recommendation is mix-aware for *tuning*, but does not subtract premix-delivered basal
 
 - `UserCalculationService::calculateForUser()` computes the **daily basal target**:
@@ -297,3 +299,57 @@ Shown on the basal-log / day screen for mix patients, fed by `/premix-reconcilia
 6. Flutter cards (§4) once the endpoint is stable.
 
 No existing separate-insulin behaviour changes; everything is gated behind `mix_basal` + `rf ∈ (0,1)` + the feature flag.
+
+---
+
+## 7. Audit Findings (pre-implementation review — 2026-05-26)
+
+**Reviewer note:** Full clinical + engineering + safety audit of the *current* code before building the feature. **Conclusion: the design in §1–§6 is sound and the algebra is verified to the decimal, but it depends on code paths that are currently buggy. Those bugs must be fixed before reconciliation is built, but NOT before clinical (Dr) sign-off, because fixing them changes the dose numbers shown to mix patients.**
+
+**Current exposure (verified):** there are **0 mix patients** in the database today (10 users total, none with `mix_basal = true`). So none of the bugs below affect a live patient *right now* — they are latent until the first mix patient is onboarded. **Decision: make no PHP changes yet; fix C1+C2 (and only then build the feature) as one reviewed change before the first real mix patient.** Separate-insulin patients never enter these code paths (all gated behind `rf ∈ (0,1)`).
+
+### 7.1 Critical — must fix before reconciliation
+
+- **C1 — Carb (bolus) dose is not grossed up by rapid fraction.**
+  In `MealLogService::calculateMealLog()` (~L338) and `calculateAggregatedMeal()` (~L1409), `correction_dose` and `delta_units_suggested` are divided by `rf`, but `bolus_carbs_dose = totalEffectiveCarbs / periodIcr` is **not**. The "effective ICR/ISF" of Config rows 125–126 is not implemented in PHP (grep: no `getEffectiveIcr`/`effective_icr`).
+  *Effect:* mix totals are wrong. User's example (50/50, ICR 16, ISF 70, 40 g, pre 144 mg/dL, target 110): expected total **5.6 U**, code produces **≈3.47 U** → under-doses carb cover (post-meal highs) AND understates delivered basal, which is exactly the sum the reconciliation relies on (`total_dose_with_iob`).
+  *Fix (pick ONE, never both — double-gross risk):* (A) gross the carb dose too: `bolusCarbsDose = (carbs/periodIcr) / rf`; or (B) implement effective ICR/ISF (`periodIcr*rf`, `periodIsf*rf`), divide by those, and REMOVE the separate `/rf` on correction/ΔUnits. Option A matches the rest of the existing code. This is a **clinical dosing decision** → defer to the Dr discussion. Pin the 2.8 ⇒ 5.6 example as a regression test.
+
+- **C2 — Rapid IOB counts the full premix shot as rapid.**
+  In `calculateIobFromPriorDoses()` (~L796): `activeRapidIob += takenDose * factor` uses the full premix `actual_dose`. For a 50/50 patient a 6 U premix dose adds 6 U rapid IOB instead of 3 U.
+  *Effect:* over-states active rapid → over-suppresses the next correction (mix patient runs high), and feeds the `actual_correction_units_est` / `actual_bolus_units_est` split the reconciliation plans to reuse.
+  *Fix:* rapid IOB for a mix dose = `takenDose × rf × factor`; the basal portion does not belong in rapid IOB.
+
+- **C3 — Forced-rapid carb cap reuses the hypo-rescue ceiling.**
+  Plan §3.2 defaults `premix_max_bedtime_carbs_g = 50` from Config row 76, but row 76 (`max_carbs_for_low`) is the *hypo-treatment* ceiling, not a "safe planned bedtime snack." 50 g of planned bedtime carbs to enable an injection is itself a large nocturnal load with rebound/overnight-hypo risk.
+  *Fix:* separate, lower default (≈30 g); and add an absolute hypo floor — never recommend completing basal via premix when bedtime BG < `lower_acceptable_bedtime_bg` (85 mg/dL), regardless of band.
+
+- **C4 — `total_dose_with_iob` is not a clean "premix units" number until C1 is fixed.** The reconciliation's `Bd_i = D_i × bf` (algorithm step 4) will sum wrong values until C1 lands.
+
+### 7.2 Engineering notes for the build
+
+- **E1 — Duplicated dosing logic.** The single-item (~L253–533) and aggregated (~L1212–1568) paths re-implement correction/carb/ΔUnits independently; the C1 bug exists in both. Extract ONE shared gross-up helper (`computeDoseColumns()`) and have both meal paths + the new service use it, so they can't drift.
+- **E2 — `basal_logs` write path.** `BasalLogController::store()` returns 422 on a second insert for the same `(user_id, log_date)`. Reconciliation write-back (§3.4) must update the existing row, not create.
+- **E3 — Snapshot freeze (already in §3.5) is a prerequisite, not optional** — without freezing `mix_type` + `rapid_fraction`, a patient switching 50/50→70/30 retro-corrupts history.
+- **E4 — "The day" must be resolved in `users.timezone`** (reuse the service's TZ memo) so a post-midnight night_snack isn't split across two reconciliation rows.
+
+### 7.3 Clinical notes for the build
+
+- **CS1 — Night-snack correction cap ordering.** The cap (`3×rf`) is applied *before* the `/rf` gross-up today, so the effective premix cap is ~3 U — correct. The C1 fix must preserve this ordering; add a test.
+- **CS2 — Basal *tuning* is already mix-aware** (`BasalLogService` divides the fasting-error ΔUnits by `1−rf`, ~L113–122). Confirms the gap is purely meal-delivered basal accounting, exactly what this feature targets. The tuning side needs no change.
+- **CS3 — Hypo threshold inconsistency.** Meal eval hard-codes 70 mg/dL (~L102) while `night_low_threshold` is configurable (60). Reconciliation's BG-aware gating (§2.3) must use the configurable threshold, and the two should be reconciled.
+- **CS4 — Basis default.** The end-of-day completion card (which recommends a real injection) must default to `basis=actual`; `planned` is only safe for daytime forecasting. Skipped/unlogged meals make the wrong basis either over- or under-deliver basal.
+
+### 7.4 Verified-correct items (no change needed)
+
+- Reconciliation algebra (§2): `B_residual`, `D_needed`, `R_forced`, `carbs_needed` — all correct given a correct `bf` and delivered sum. User's case reproduces exactly (7.2 → 14.4 U → 7.2 U rapid → 86.4 g).
+- `B_target` precedence (§3.1) matches the live `BasalLogController::basalDoseHint()` (robust-autotune when `eligible_count ≥ min_eligible_n_basal`, else `UserCalculationService.basal_dose`) — reuse that method, don't re-derive.
+- `applicable:false` gating for `rf ∉ (0,1)` is correct; keep the `bf=0` division guard as the first check.
+
+### 7.5 Required tests (when built)
+
+Gross-up parity (2.8 ⇒ 5.6 for 50/50; 9.33 for 70/30; 11.2 for 75/25) · mix rapid-IOB (6 U 50/50 ⇒ 3 U rapid IOB) · two-meal reconciliation (residual 7.2, carbs 86, band=discourage) · `bf=0` ⇒ `applicable:false` · skipped meal actual-vs-planned · BG below night-low ⇒ hard-stop · post-midnight night_snack day assignment · second-meal `basal_logs` update (no 422).
+
+### 7.6 Deployment note
+
+Fixing C1/C2 will change the dose numbers shown to mix patients (carb-heavy meals roughly double — a correction of an unsafe under-dose). With 0 mix patients today this is currently zero-impact; once patients exist, recalc via the existing `recalculateMealLog` snapshot-replay path and consider clinician-gating active patients.
