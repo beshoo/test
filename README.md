@@ -280,7 +280,19 @@ This keeps reconciliation auditable next to the existing `eligible_night` / `del
 
 ### 3.5 Snapshot change
 
-In `MealLogService` add `mix_type` and `rapid_fraction` to the `override_snapshot` array (§1.4). One-line addition next to the existing `period_icr`/`period_isf` freeze; makes historical reconciliation replay-safe when a patient later switches mix type.
+In `MealLogService` add `mix_type` and `rapid_fraction` to the `override_snapshot` array (§1.4). One-line addition next to the existing `period_icr`/`period_isf` freeze; makes historical reconciliation replay-safe when a patient later **switches mix type *or leaves mix entirely* (mix → separate Rapid+Basal)** — see Q-F (§5.1). A meal logged on 50/50 stays a 50/50 meal forever; the reconciliation card simply turns `applicable:false` for rows/days after the patient leaves mix.
+
+### 3.6 Database change summary (verified against live schema 2026-05-30)
+
+The whole feature touches the DB in **three** ways — **one** real schema migration on an existing table, **one** seeder, and **one** JSON-content change that needs no `ALTER TABLE`. All additive, all nullable, fully backward-compatible, and inert until the first `mix_basal = true` patient exists.
+
+| # | Target | Kind | Change | Verified state today |
+|---|---|---|---|---|
+| 1 | `basal_logs` | **Schema migration** (add 4 nullable columns) | `premix_basal_delivered_u` (decimal, null), `premix_basal_residual_u` (decimal, null), `premix_final_carbs_g` (decimal/int, null), `premix_strategy` (string, null). One row/day; write-back **updates** the existing row, never inserts (E2). | columns do **not** exist yet (confirmed `hasColumn=false`) |
+| 2 | `global_configs` | **Seeder rows** (no schema change) | Insert keys: `premix_reconciliation_enabled=1`, `premix_safe_forced_rapid_u=1.5`, `premix_max_bedtime_carbs_g=30`, `premix_min_bedtime_bg_mgdl=85`, `premix_final_period_default=night_snack`. Defaults pending Dr. (Q-C). | table shape already supports `key/category/value/data_type/...`; rows not present |
+| 3 | `meal_logs.override_snapshot` | **JSON content only** (no schema change) | Add two keys *inside* the existing JSON: `mix_type`, `rapid_fraction`. Written by `MealLogService` at calc time (§3.5). | `override_snapshot` column already exists (confirmed) |
+
+**What does NOT change:** no new table; no second `MealLog` model (Dr. Q&A, §5.1 Q-F); no change to `users` (`mix_basal`/`mix_type` already exist — switching type is an `UPDATE`); no back-fill or migration of historical meal rows (old snapshots stay frozen).
 
 ---
 
@@ -331,6 +343,30 @@ Shown on the basal-log / day screen for mix patients, fed by `/premix-reconcilia
 2. **Cap completion vs tolerate underdelivery?** Do both, by band. Small residuals → complete via premix + small snack. Large residuals → explicitly recommend tolerating partial underdelivery overnight (with a "fasting may run higher tomorrow" note) rather than forcing a big carb load.
 3. **Recommend split / supplemental pure basal above a threshold?** Yes — that's the "large" band's primary recommendation: supplemental **pure basal** (`B_residual` U, zero forced rapid, zero carbs) when available, and/or rebalancing the AM/PM premix split (`am_mix_percent`/`pm_mix_percent` already computed) so less basal is left for the last shot.
 4. **UI representation?** A single bilingual "Basal completion" card (§4.2) showing: target, delivered (with per-meal breakdown), residual, the forced-rapid + carb cost of completing via premix, a clear severity flag, and the recommended strategy — with the carb-offset path behind an expander so it's available but not the default for risky amounts.
+
+### 5.1 Dr. follow-up questions (2026-05-30)
+
+**Q-E — How does auto-tune work for a mix patient, who has no separate basal injection to tune?**
+A mix patient never injects a standalone basal dose, so there is no basal *injection* to auto-tune the way a separate-insulin patient's is. The system handles it in two layers, and **no glucose input is wasted**:
+
+1. **Meal ratios still tune from pre/post-meal glucose.** `RobustAutoTuneService` tunes period ICR/ISF from logged meals exactly as today (the meal data is mix-grossed correctly once C1/C5/C6 land). This is unchanged by mix.
+2. **The daily basal *target* still tunes from bedtime→morning glucose.** `RobustAutoTuneService::calculateBasal()` recommends `suggested_new_basal` from eligible nights' bedtime→morning delta, and the tuning is already mix-aware (`BasalLogService` divides the fasting-error ΔUnits by `1 − rf` — CS2). That yields the *target basal units the patient needs per day*.
+3. **The new reconciliation feature converts that target into action.** Instead of "inject X basal," it tracks the basal already delivered through each premix meal shot (`Bd_i = D_i × bf`), subtracts it from the tuned target → residual, and recommends the *remaining* basal at bedtime plus whether completing it with more mix is safe or forces a hypo (§2). So for a mix patient the recommendation **changes shape from "inject X basal" to "you still need X basal today — here's how to deliver it without a hypo."** The tuned target (`B_target`) is the input to that, exactly as §3.1 step 3 specifies.
+
+**Q-F — What happens to a patient's data when they switch FROM mix TO separate Rapid+Basal (or back)?**
+Old data is kept and stays correct — untouched. Two reasons:
+- **Insulin type is a setting on the *patient*, not on each meal** (`users.mix_basal` / `users.mix_type` — single mutable columns). Switching is one field update going forward: no second model, no migration of historical meals.
+- **Every meal already freezes a snapshot of the settings active when it was logged**, and this plan adds `mix_type` + `rapid_fraction` to that snapshot (§3.5). So a meal logged on 50/50 **stays a 50/50 meal forever**, even after the patient leaves mix.
+
+Behaviour on each switch direction:
+
+| Switch | Old rows | New rows | Reconciliation card |
+|---|---|---|---|
+| Mix A → Mix B (e.g. 50/50 → 70/30) | frozen, replay against own snapshot | use new `rf` | keeps working with new `rf` |
+| **Mix → separate Rapid+Basal** | frozen mix rows stay valid history | route through the normal rapid path (`rf = 1`) | turns **off** (`applicable:false`) going forward — the patient now injects real basal separately, which the existing basal flow already handles |
+| Separate → Mix | unchanged rapid history | start delivering basal via meals | turns **on** once `mix_basal = true` |
+
+For auto-tune after any switch: the system simply collects fresh data under the new regimen and re-bases naturally as new logs accumulate (the same way it already re-bases when any setting like ICR is changed via the override-timestamp gate). Historical rows under the old regimen remain valid records of what happened then and are never rewritten. **One model, type frozen per meal, fully reversible, no data loss.**
 
 ---
 
@@ -397,7 +433,7 @@ No existing separate-insulin behaviour changes; everything is gated behind `mix_
 
 - **E1 — Duplicated dosing logic.** The single-item (~L253–533) and aggregated (~L1212–1568) paths re-implement correction/carb/ΔUnits independently; the C1 bug exists in both. Extract ONE shared gross-up helper (`computeDoseColumns()`) and have both meal paths + the new service use it, so they can't drift.
 - **E2 — `basal_logs` write path.** `BasalLogController::store()` returns 422 on a second insert for the same `(user_id, log_date)`. Reconciliation write-back (§3.4) must update the existing row, not create.
-- **E3 — Snapshot freeze (already in §3.5) is a prerequisite, not optional** — without freezing `mix_type` + `rapid_fraction`, a patient switching 50/50→70/30 retro-corrupts history.
+- **E3 — Snapshot freeze (already in §3.5) is a prerequisite, not optional** — without freezing `mix_type` + `rapid_fraction`, a patient switching 50/50→70/30 (or leaving mix for separate Rapid+Basal) retro-corrupts history. See Q-F (§5.1) for the full switch matrix.
 - **E4 — "The day" must be resolved in `users.timezone`** (reuse the service's TZ memo) so a post-midnight night_snack isn't split across two reconciliation rows.
 
 ### 7.3 Clinical notes for the build
