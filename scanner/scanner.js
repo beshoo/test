@@ -1,0 +1,458 @@
+/**
+ * BarcodeScanner — camera barcode/QR scanner for the browser. No license key.
+ *
+ * Engines:
+ *   - 'zxing'  : ZXing-C++ (WebAssembly, self-hosted) in a Web Worker, with the
+ *                multi-strategy / region-of-interest / confirmation pipeline in
+ *                engine/decode-core.js. Works in every modern browser.
+ *   - 'native' : the browser's Barcode Detection API (Chrome on Android, where it
+ *                is backed by Google ML Kit). Fast, but not available on iOS,
+ *                Firefox or desktop Chrome on Windows/Linux.
+ *   - 'auto'   : native when it exists and supports every requested format,
+ *                otherwise zxing.
+ *
+ * Camera access needs a secure context: HTTPS, or http://localhost.
+ *
+ *   import { BarcodeScanner } from './scanner.js';
+ *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
+ *   await scanner.start();
+ */
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js';
+
+/** Formats offered in the UI (both engines understand these names). */
+export const COMMON_FORMATS = [
+  'qr_code', 'data_matrix', 'aztec', 'pdf417',
+  'ean_13', 'ean_8', 'upc_a', 'upc_e',
+  'code_128', 'code_39', 'code_93', 'codabar', 'itf',
+];
+
+// ---------------------------------------------------------------------------
+// Engines
+// ---------------------------------------------------------------------------
+
+let sharedWorker = null;
+
+/** ZXing in a module Web Worker. One worker is shared by all scanners on the page. */
+class ZXingWorkerEngine {
+  constructor() {
+    this.name = 'zxing';
+    if (!sharedWorker) {
+      const worker = new Worker(new URL('./engine/worker.js', import.meta.url), { type: 'module' });
+      const pending = new Map();
+      let nextId = 1;
+      worker.onmessage = ({ data }) => {
+        const p = pending.get(data.id);
+        if (!p) return;
+        pending.delete(data.id);
+        if (data.error) p.reject(new Error(data.error));
+        else p.resolve(data.results);
+      };
+      worker.onerror = (e) => {
+        const err = new Error(`Decoder worker failed: ${e.message || 'unknown error'}`);
+        pending.forEach((p) => p.reject(err));
+        pending.clear();
+      };
+      const call = (msg, transfer = []) => new Promise((resolve, reject) => {
+        const id = nextId++;
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ ...msg, id }, transfer);
+      });
+      sharedWorker = { worker, call, ready: call({ type: 'ping' }) };
+      sharedWorker.ready.catch(() => { sharedWorker = null; });
+    }
+    this._w = sharedWorker;
+  }
+
+  ready() {
+    return this._w.ready;
+  }
+
+  /** @param {ImageData} image ownership of image.data.buffer is transferred */
+  decode(image, { formats, strategy, offset, all = false }) {
+    const img = { data: image.data, width: image.width, height: image.height };
+    return this._w.call({ image: img, formats, strategy, offset, all }, [image.data.buffer]);
+  }
+}
+
+/** The browser's own BarcodeDetector. */
+class NativeEngine {
+  constructor(formats) {
+    this.name = 'native';
+    this._detector = new globalThis.BarcodeDetector(formats.length ? { formats } : undefined);
+  }
+
+  ready() {
+    return Promise.resolve();
+  }
+
+  async decode(source, { offset = { x: 0, y: 0 } }) {
+    const codes = await this._detector.detect(source);
+    return codes.map((c) => {
+      const pts = c.cornerPoints.map((p) => ({ x: p.x + offset.x, y: p.y + offset.y }));
+      const b = c.boundingBox;
+      return {
+        rawValue: c.rawValue,
+        format: c.format,
+        symbologyIdentifier: '',
+        isGS1: false,
+        cornerPoints: pts,
+        boundingBox: { x: b.x + offset.x, y: b.y + offset.y, width: b.width, height: b.height },
+        strategy: 'native',
+      };
+    });
+  }
+}
+
+async function nativeSupports(formats) {
+  if (typeof globalThis.BarcodeDetector !== 'function') return false;
+  try {
+    const supported = await globalThis.BarcodeDetector.getSupportedFormats();
+    return supported.length > 0 && formats.every((f) => supported.includes(f));
+  } catch {
+    return false;
+  }
+}
+
+/** @param {'auto'|'native'|'zxing'} engine */
+export async function createEngine(formats = [], engine = 'auto') {
+  if (engine !== 'zxing' && (await nativeSupports(formats))) return new NativeEngine(formats);
+  if (engine === 'native') throw new Error('The native BarcodeDetector is not available for these formats.');
+  const e = new ZXingWorkerEngine();
+  await e.ready();
+  return e;
+}
+
+// ---------------------------------------------------------------------------
+// Still images
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a still image (File/Blob, <img>, ImageBitmap, canvas). With the zxing
+ * engine every strategy is tried until one succeeds.
+ */
+export async function scanImage(source, { formats = [], engine = 'auto', maxSize = 3000 } = {}) {
+  const eng = await createEngine(formats, engine);
+  const bitmap = source instanceof Blob ? await createImageBitmap(source) : source;
+  try {
+    const w0 = bitmap.naturalWidth || bitmap.videoWidth || bitmap.width;
+    const h0 = bitmap.naturalHeight || bitmap.videoHeight || bitmap.height;
+    const scale = Math.min(1, maxSize / Math.max(w0, h0));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(w0 * scale);
+    canvas.height = Math.round(h0 * scale);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const input = eng.name === 'native' ? canvas : ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const results = await eng.decode(input, { formats, all: true });
+    return results.map((r) => scaleResult(r, 1 / scale));
+  } finally {
+    if (bitmap !== source) bitmap.close?.();
+  }
+}
+
+function scaleResult(r, k) {
+  if (k === 1) return r;
+  return {
+    ...r,
+    cornerPoints: r.cornerPoints.map((p) => ({ x: p.x * k, y: p.y * k })),
+    boundingBox: { x: r.boundingBox.x * k, y: r.boundingBox.y * k, width: r.boundingBox.width * k, height: r.boundingBox.height * k },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Live camera scanner
+// ---------------------------------------------------------------------------
+
+export class BarcodeScanner {
+  /**
+   * @param {HTMLVideoElement} video
+   * @param {object} [options]
+   * @param {string[]} [options.formats]               formats to look for ([] = all)
+   * @param {(codes: object[]) => void} [options.onDetect]  new, confirmed, de-duplicated codes
+   * @param {(err: Error) => void} [options.onError]
+   * @param {'auto'|'native'|'zxing'} [options.engine='auto']
+   * @param {boolean} [options.continuous=true]        false = stop after the first hit
+   * @param {string} [options.deviceId]                camera to use (see listCameras)
+   * @param {number} [options.maxDecodeSize=1280]      longest edge of the downscaled full-frame pass
+   * @param {() => {x:number,y:number,width:number,height:number}|null} [options.getRegion]
+   *        region of interest in video pixels, decoded at full resolution on alternate frames.
+   *        Default: the central 76% × 64% of the frame.
+   * @param {number} [options.confirmLinear=2]         frames that must agree before a 1D code is reported
+   * @param {number} [options.duplicateTimeoutMs=1500] suppress the same value for this long
+   * @param {number} [options.scanIntervalMs=0]        minimum time between decode attempts
+   */
+  constructor(video, options = {}) {
+    if (!(video instanceof HTMLVideoElement)) throw new TypeError('BarcodeScanner needs a <video> element');
+    this.video = video;
+    this.options = {
+      formats: [],
+      onDetect: () => {},
+      onError: (err) => console.error(err),
+      engine: 'auto',
+      continuous: true,
+      deviceId: undefined,
+      maxDecodeSize: 1280,
+      getRegion: null,
+      confirmLinear: 2,
+      duplicateTimeoutMs: 1500,
+      scanIntervalMs: 0,
+      ...options,
+    };
+    this.engine = null;
+    this.stream = null;
+    this.lastResults = [];
+    this.stats = { frames: 0, decodeMs: 0 };
+    this._running = false;
+    this._busy = false;
+    this._pass = 0;
+    this._lastScanAt = 0;
+    this._seen = new Map();    // rawValue -> last reported time
+    this._pending = new Map(); // rawValue -> {count, t} awaiting confirmation
+    this._canvas = document.createElement('canvas');
+    this._ctx = this._canvas.getContext('2d', { willReadFrequently: true });
+    this._frameHandle = null;
+    this._tick = this._tick.bind(this);
+
+    video.setAttribute('playsinline', ''); // iOS: don't go fullscreen
+    video.muted = true;
+  }
+
+  get running() {
+    return this._running;
+  }
+
+  /** Cameras available to the page. Labels are empty until permission is granted. */
+  static async listCameras() {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === 'videoinput');
+  }
+
+  async start() {
+    if (this._running) return;
+    if (!window.isSecureContext) throw new Error('Camera access requires HTTPS (or localhost).');
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser has no camera API.');
+
+    this.engine = await createEngine(this.options.formats, this.options.engine);
+
+    const which = this.options.deviceId
+      ? { deviceId: { exact: this.options.deviceId } }
+      : { facingMode: { ideal: 'environment' } };
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { ...which, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+    });
+
+    // Continuous autofocus where the device allows it.
+    const caps = this.capabilities;
+    if (caps.focusMode?.includes('continuous')) {
+      this.track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+    }
+
+    this.video.srcObject = this.stream;
+    await this.video.play();
+    this._running = true;
+    this._seen.clear();
+    this._pending.clear();
+    this._schedule();
+  }
+
+  stop() {
+    this._running = false;
+    if (this._frameHandle !== null) {
+      if (this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this._frameHandle);
+      else cancelAnimationFrame(this._frameHandle);
+      this._frameHandle = null;
+    }
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    this.video.srcObject = null;
+    this.lastResults = [];
+  }
+
+  /** Restart with a different camera. */
+  async switchCamera(deviceId) {
+    this.options.deviceId = deviceId || undefined;
+    if (this._running) {
+      this.stop();
+      await this.start();
+    }
+  }
+
+  /** Change the formats being scanned for. */
+  async setFormats(formats) {
+    this.options.formats = formats;
+    if (this._running) this.engine = await createEngine(formats, this.options.engine);
+  }
+
+  // --- camera controls ------------------------------------------------------
+
+  get track() {
+    return this.stream?.getVideoTracks()[0] ?? null;
+  }
+
+  get capabilities() {
+    return this.track?.getCapabilities?.() ?? {};
+  }
+
+  get torchSupported() {
+    return Boolean(this.capabilities.torch);
+  }
+
+  async setTorch(on) {
+    if (!this.torchSupported) return false;
+    await this.track.applyConstraints({ advanced: [{ torch: Boolean(on) }] });
+    return true;
+  }
+
+  /** {min, max, step} when the camera supports zoom, else null. */
+  get zoomRange() {
+    const z = this.capabilities.zoom;
+    return z && z.max > z.min ? z : null;
+  }
+
+  async setZoom(value) {
+    if (!this.zoomRange) return false;
+    await this.track.applyConstraints({ advanced: [{ zoom: value }] });
+    return true;
+  }
+
+  /**
+   * Focus on a point (0..1 in video coordinates) where the camera supports it,
+   * otherwise re-trigger autofocus. Returns true if a focus command was sent.
+   */
+  async focusAt(x, y) {
+    const caps = this.capabilities;
+    const advanced = {};
+    if (caps.pointsOfInterest || 'pointsOfInterest' in (this.track?.getSettings?.() ?? {})) {
+      advanced.pointsOfInterest = [{ x, y }];
+    }
+    if (caps.focusMode?.includes('single-shot')) advanced.focusMode = 'single-shot';
+    else if (caps.focusMode?.includes('continuous')) advanced.focusMode = 'continuous';
+    if (!Object.keys(advanced).length) return false;
+    try {
+      await this.track.applyConstraints({ advanced: [advanced] });
+      if (advanced.focusMode === 'single-shot' && caps.focusMode.includes('continuous')) {
+        setTimeout(() => this.track?.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {}), 1500);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // --- frame loop -------------------------------------------------------------
+
+  _schedule() {
+    if (!this._running) return;
+    this._frameHandle = this.video.requestVideoFrameCallback
+      ? this.video.requestVideoFrameCallback(this._tick)
+      : requestAnimationFrame(this._tick);
+  }
+
+  _region(vw, vh) {
+    const r = this.options.getRegion?.();
+    if (r && r.width > 16 && r.height > 16) {
+      const x = Math.max(0, Math.floor(r.x)), y = Math.max(0, Math.floor(r.y));
+      return { x, y, width: Math.min(vw - x, Math.ceil(r.width)), height: Math.min(vh - y, Math.ceil(r.height)) };
+    }
+    return { x: Math.round(vw * 0.12), y: Math.round(vh * 0.18), width: Math.round(vw * 0.76), height: Math.round(vh * 0.64) };
+  }
+
+  /**
+   * Choose what this frame decodes. Passes alternate between
+   *   - the region of interest at full camera resolution (small/far codes), and
+   *   - the whole frame downscaled to maxDecodeSize (codes anywhere in view),
+   * and with the zxing engine each pair of passes uses the next strategy on the ladder.
+   */
+  _plan(vw, vh) {
+    const pass = this._pass++;
+    const needsDownscale = Math.max(vw, vh) > this.options.maxDecodeSize;
+    const roiPass = needsDownscale && pass % 2 === 0;
+    const strategy = Math.floor(pass / (needsDownscale ? 2 : 1)) % STRATEGIES.length;
+    if (roiPass) {
+      const r = this._region(vw, vh);
+      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy };
+    }
+    const scale = Math.min(1, this.options.maxDecodeSize / Math.max(vw, vh));
+    return { sx: 0, sy: 0, sw: vw, sh: vh, scale, strategy };
+  }
+
+  async _tick() {
+    if (!this._running) return;
+    const now = performance.now();
+    const video = this.video;
+    if (this._busy || now - this._lastScanAt < this.options.scanIntervalMs || video.readyState < 2 || !video.videoWidth) {
+      this._schedule();
+      return;
+    }
+    this._busy = true;
+    this._lastScanAt = now;
+    this._schedule();
+
+    try {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const plan = this._plan(vw, vh);
+      const w = Math.round(plan.sw * plan.scale), h = Math.round(plan.sh * plan.scale);
+      if (this._canvas.width !== w || this._canvas.height !== h) {
+        this._canvas.width = w;
+        this._canvas.height = h;
+      }
+      this._ctx.drawImage(video, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, w, h);
+
+      const engine = this.engine;
+      const input = engine.name === 'native' ? this._canvas : this._ctx.getImageData(0, 0, w, h);
+      const t0 = performance.now();
+      const found = await engine.decode(input, { formats: this.options.formats, strategy: plan.strategy });
+      this.stats.frames += 1;
+      this.stats.decodeMs += performance.now() - t0;
+      if (!this._running) return;
+
+      // Back to video pixel coordinates.
+      const inv = 1 / plan.scale;
+      const results = found.map((r) => {
+        const s = scaleResult(r, inv);
+        const pts = s.cornerPoints.map((p) => ({ x: p.x + plan.sx, y: p.y + plan.sy }));
+        return { ...s, cornerPoints: pts, boundingBox: { ...s.boundingBox, x: s.boundingBox.x + plan.sx, y: s.boundingBox.y + plan.sy } };
+      });
+      // Keep outlines on screen briefly so they don't flicker between passes.
+      const tNow = performance.now();
+      if (results.length) {
+        this.lastResults = results;
+        this._lastHitAt = tNow;
+      } else if (!this._lastHitAt || tNow - this._lastHitAt > 300) {
+        this.lastResults = [];
+      }
+
+      const fresh = this._accept(results, tNow);
+      if (fresh.length) {
+        this.options.onDetect(fresh);
+        if (!this.options.continuous) this.stop();
+      }
+    } catch (err) {
+      this.options.onError(err);
+    } finally {
+      this._busy = false;
+    }
+  }
+
+  /** Multi-frame confirmation for 1D codes + duplicate suppression. */
+  _accept(results, now) {
+    const out = [];
+    for (const [value, p] of this._pending) if (now - p.t > 1500) this._pending.delete(value);
+    for (const r of results) {
+      const needed = LINEAR_FORMATS.has(r.format) ? this.options.confirmLinear : 1;
+      if (needed > 1) {
+        const p = this._pending.get(r.rawValue) ?? { count: 0, t: now };
+        p.count += 1;
+        p.t = now;
+        this._pending.set(r.rawValue, p);
+        if (p.count < needed) continue;
+      }
+      const last = this._seen.get(r.rawValue);
+      this._seen.set(r.rawValue, now);
+      if (last === undefined || now - last > this.options.duplicateTimeoutMs) out.push(r);
+    }
+    return out;
+  }
+}
