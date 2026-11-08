@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=ea7b05a-202611080003';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -37,7 +37,7 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!sharedWorker) {
-      const worker = new Worker(new URL('./engine/worker.js', import.meta.url), { type: 'module' });
+      const worker = new Worker(new URL('./engine/worker.js?v=ea7b05a-202611080003', import.meta.url), { type: 'module' });
       const pending = new Map();
       let nextId = 1;
       worker.onmessage = ({ data }) => {
