@@ -287,6 +287,26 @@ function contextTemplate(before, set, dg, after, si, bi) {
   return t;
 }
 
+/**
+ * Build every blur-model template ahead of time (about 2,400; a few hundred ms
+ * in a worker) so the first real frames are not slowed down by rendering them.
+ * The contexts are few: left digits are preceded by 01 or 11 and followed by 0 or 01;
+ * right digits are preceded by 10 or 00 and followed by 1 or 10.
+ */
+export function warmUp() {
+  for (let bi = 0; bi < BIASES.length; bi += 1) {
+    for (let si = 0; si < SIGMAS.length; si += 1) {
+      for (let dg = 0; dg < 10; dg += 1) {
+        for (const before of [[0, 1], [1, 1]]) for (const after of [[0], [0, 1]]) {
+          contextTemplate(before, 0, dg, after, si, bi);
+          contextTemplate(before, 1, dg, after, si, bi);
+        }
+        for (const before of [[1, 0], [0, 0]]) for (const after of [[1], [1, 0]]) contextTemplate(before, 2, dg, after, si, bi);
+      }
+    }
+  }
+}
+
 const BEAM = 5;
 const MAX_DIGIT_MISFIT = 0.2; // average 1 - R^2 per digit
 const MIN_LEAD = 1.02;        // best sequence must beat the runner-up by 2%
