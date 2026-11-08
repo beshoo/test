@@ -111,8 +111,8 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=3850c10-202611080044';
-  import { parseGS1 } from './gs1.js?v=3850c10-202611080044';
+  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=ce2af1d-202611080057';
+  import { parseGS1 } from './gs1.js?v=ce2af1d-202611080057';
 
   const $ = (id) => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
@@ -172,8 +172,15 @@
       $('engine').textContent = ENGINE_LABEL[scanner.engine.name] ?? scanner.engine.name;
       $('engine').hidden = false;
       setupCameraControls();
-      if (scanner.autofocus === false) {
-        showError(new Error('This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
+      if (scanner.autoSwitched) {
+        saveCamera(scanner.autoSwitched.deviceId);
+        await fillCameras();
+        showError(new Error(`Switched to ${scanner.autoSwitched.to}: ${scanner.autoSwitched.from} has no autofocus. You can pick it again from the list.`));
+      } else if (scanner.autofocus === false) {
+        const checked = (scanner.cameraReport || []).length > 1;
+        showError(new Error(checked
+          ? 'This camera has no autofocus, so barcodes up close will look blurry, and none of the other back cameras has autofocus either. Hold the code a little further away.'
+          : 'This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
       }
       $('idle').hidden = true; $('guide').hidden = false;
       drawLoop();

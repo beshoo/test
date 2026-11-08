@@ -550,7 +550,7 @@ function readWidths(line, wantEan13, wantEan8) {
  * direction and its perpendicular and take the extent; the bars run perpendicular
  * to the scan lines, so extend that way to cover their full height.
  */
-function barcodeOutline(spans) {
+function barcodeOutline(spans, lum, w, h) {
   if (!spans.length) return null;
   // Bar direction: the start points of the agreeing lines lie on the barcode's left
   // edge and the end points on its right edge, so the line through them runs along
@@ -584,11 +584,42 @@ function barcodeOutline(spans) {
   }
   const len = u1 - u0;
   if (!(len > 0)) return null;
-  // EAN bars are about 0.7x the symbol width tall; centre that on the agreeing lines
-  const mid = (v0 + v1) / 2, half = Math.max((v1 - v0) / 2, len * 0.35);
-  v0 = mid - half; v1 = mid + half;
   const pt = (u, v) => ({ x: u * ax + v * bx, y: u * ay + v * by });
-  return [pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1)];
+  // Bar height: walk outward along the bars from the agreeing lines and stop where
+  // a line across the code no longer crosses many edges (top and bottom of the bars).
+  if (lum) {
+    const edgesAt = (v) => {
+      const n = Math.max(40, Math.round(len * 0.8));
+      let prev = null, count = 0, maxD = 0;
+      const vals = new Float32Array(n);
+      for (let i = 0; i < n; i += 1) {
+        const p = pt(u0 + len * 0.1 + (len * 0.8 * i) / n, v);
+        const xi = Math.round(p.x), yi = Math.round(p.y);
+        vals[i] = xi >= 0 && yi >= 0 && xi < w && yi < h ? lum[yi * w + xi] : (i ? vals[i - 1] : 0);
+      }
+      for (let i = 1; i < n; i += 1) maxD = Math.max(maxD, Math.abs(vals[i] - vals[i - 1]));
+      const thr = Math.max(6, maxD * 0.3);
+      for (let i = 1; i < n; i += 1) {
+        const d = vals[i] - vals[i - 1];
+        if (Math.abs(d) < thr) continue;
+        const sgn = d > 0;
+        if (prev !== null && sgn !== prev) count += 1;
+        prev = sgn;
+      }
+      return count;
+    };
+    const mid = (v0 + v1) / 2, ref = edgesAt(mid);
+    if (ref >= 10) {
+      const step = Math.max(1, len * 0.02);
+      let top = v0, bottom = v1;
+      while (top - mid > -len && edgesAt(top - step) >= ref * 0.4) top -= step;
+      while (bottom - mid < len && edgesAt(bottom + step) >= ref * 0.4) bottom += step;
+      return [pt(u0, top), pt(u1, top), pt(u1, bottom), pt(u0, bottom)];
+    }
+  }
+  // fallback: EAN bars are often about 0.7x the symbol width tall
+  const mid = (v0 + v1) / 2, half = Math.max((v1 - v0) / 2, len * 0.35);
+  return [pt(u0, mid - half), pt(u1, mid - half), pt(u1, mid + half), pt(u0, mid + half)];
 }
 
 /**
@@ -596,6 +627,8 @@ function barcodeOutline(spans) {
  * @param {string[]} formats requested formats ([] = all)
  * @returns {{rawValue: string, format: string, lines: number, cornerPoints: {x,y}[]}[]}
  */
+let lastAngle = 0; // scan angle of the last successful read (per worker)
+
 export function decodeEanGrey(img, formats = []) {
   const want = (f) => !formats.length || formats.includes(f);
   const wantEan13 = want('ean_13') || want('upc_a');
@@ -616,7 +649,46 @@ export function decodeEanGrey(img, formats = []) {
   const verified = new Map();   // edge-read value -> model checks passed
   const contradicted = new Set(); // edge-read values the model disagreed with
 
-  for (let deg = 0; deg < 180; deg += 10) {
+  // Blur model on lines the edge reader could not read, within a time budget,
+  // stopping as soon as two lines agree on a value. Called early with the lines
+  // near the last good angle, and again after all angles.
+  const agreed = () => [...votes.values()].some((v) => v.count >= 2);
+  const modelStart = Date.now();
+  let tried = 0;
+  const runModel = () => {
+    if (agreed() || !modelQueue.length) return;
+    modelQueue.sort((a, b) => a.pri - b.pri);
+    while (modelQueue.length) {
+      if (tried >= MODEL_MAX_LINES || Date.now() - modelStart > MODEL_BUDGET_MS) return;
+      const q = modelQueue.shift();
+      tried += 1;
+      const text = modelLine(q.line.profile, q.n, q.c.xa, q.c.xb);
+      if (!text) continue;
+      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], spans: [], methods: new Set(), angle: q.deg };
+      v.methods.add('model');
+      v.count += 1;
+      v.pts.push({ x: q.sx + q.dx * q.n / 2, y: q.sy + q.dy * q.n / 2 });
+      const a = q.dir ? q.n - 1 - q.c.xa : q.c.xa, b = q.dir ? q.n - 1 - q.c.xb : q.c.xb;
+      v.spans.push({ ax: q.sx + q.dx * a, ay: q.sy + q.dy * a, bx: q.sx + q.dx * b, by: q.sy + q.dy * b, dx: q.dx, dy: q.dy });
+      votes.set(text, v);
+      if (agreed()) return;
+    }
+  };
+
+  // Start at the angle that worked last time (or horizontal) and fan out from it;
+  // stop once one value has 4 agreeing lines and nothing competes with it.
+  const angles = [];
+  for (let k = 0; k < 18; k += 1) {
+    const step = Math.ceil(k / 2) * 10 * (k % 2 ? 1 : -1);
+    angles.push(((lastAngle + step) % 180 + 180) % 180);
+  }
+  const settled = () => {
+    const counts = [...votes.values()].map((v) => v.count).sort((x, y) => y - x);
+    return counts[0] >= 4 && (counts[1] ?? 0) === 0;
+  };
+  for (const [ai, deg] of angles.entries()) {
+    if (settled()) break;
+    if (ai === 5) { runModel(); if (agreed()) break; }
     const a = (deg * Math.PI) / 180, dx = Math.cos(a), dy = Math.sin(a);
     // the line through the centre spans the image; offset it perpendicular
     const half = Math.abs(w * dy) / 2 + Math.abs(h * dx) / 2; // perpendicular half-extent
@@ -644,7 +716,7 @@ export function decodeEanGrey(img, formats = []) {
         if (!read.length && wantEan13) {
           for (const c of modelCandidates(line)) {
             // most EAN-like first: 59 elements nominal, a few merged by blur
-            modelQueue.push({ line, c, sx, sy, dx, dy, n, dir, pri: Math.abs(c.elements - 57) + Math.abs(off) / half });
+            modelQueue.push({ line, c, sx, sy, dx, dy, n, dir, deg, pri: Math.abs(c.elements - 57) + Math.abs(off) / half });
           }
         }
         for (const r of read) {
@@ -655,7 +727,7 @@ export function decodeEanGrey(img, formats = []) {
             if (mt && mt !== r.text) { contradicted.add(r.text); continue; }
             verified.set(r.text, (verified.get(r.text) ?? 0) + 1);
           }
-          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], spans: [], methods: new Set() };
+          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], spans: [], methods: new Set(), angle: deg };
           v.methods.add(r.method || 'edges');
           v.count += 1;
           // approximate location: the scan line's midpoint
@@ -672,28 +744,7 @@ export function decodeEanGrey(img, formats = []) {
     }
   }
 
-  // Blur model on lines the edge reader could not read, within a time budget,
-  // stopping as soon as two lines agree on a value.
-  const agreed = () => [...votes.values()].some((v) => v.count >= 2);
-  if (!agreed() && modelQueue.length) {
-    modelQueue.sort((a, b) => a.pri - b.pri);
-    const t0 = Date.now();
-    let tried = 0;
-    for (const q of modelQueue) {
-      if (tried >= MODEL_MAX_LINES || Date.now() - t0 > MODEL_BUDGET_MS) break;
-      tried += 1;
-      const text = modelLine(q.line.profile, q.n, q.c.xa, q.c.xb);
-      if (!text) continue;
-      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], spans: [], methods: new Set() };
-      v.methods.add('model');
-      v.count += 1;
-      v.pts.push({ x: q.sx + q.dx * q.n / 2, y: q.sy + q.dy * q.n / 2 });
-      const a = q.dir ? q.n - 1 - q.c.xa : q.c.xa, b = q.dir ? q.n - 1 - q.c.xb : q.c.xb;
-      v.spans.push({ ax: q.sx + q.dx * a, ay: q.sy + q.dy * a, bx: q.sx + q.dx * b, by: q.sy + q.dy * b, dx: q.dx, dy: q.dy });
-      votes.set(text, v);
-      if (agreed()) break;
-    }
-  }
+  runModel();
 
   const out = [];
   for (const [text, v] of votes) {
@@ -701,7 +752,7 @@ export function decodeEanGrey(img, formats = []) {
     if (contradicted.has(text)) continue; // the blur model read something else on one of its lines
     const xs = v.pts.map((p) => p.x), ys = v.pts.map((p) => p.y);
     const x0 = Math.min(...xs) - 20, x1 = Math.max(...xs) + 20, y0 = Math.min(...ys) - 20, y1 = Math.max(...ys) + 20;
-    const outline = barcodeOutline(v.spans);
+    const outline = barcodeOutline(v.spans, lum, w, h);
     let format = v.format, value = text;
     if (format === 'ean_13' && !want('ean_13') && text.startsWith('0')) { format = 'upc_a'; value = text.slice(1); }
     if (format === 'ean_13' && !want('ean_13') && !text.startsWith('0')) continue;
@@ -718,5 +769,6 @@ export function decodeEanGrey(img, formats = []) {
   // has more than half, both are suspect, so report nothing for this frame.
   out.sort((a, b) => b.lines - a.lines);
   if (out.length > 1 && out[1].lines * 2 > out[0].lines) return [];
+  if (out.length) lastAngle = votes.get(out[0].format === 'upc_a' ? '0' + out[0].rawValue : out[0].rawValue)?.angle ?? lastAngle;
   return out.slice(0, 1);
 }
