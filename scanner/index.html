@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Barcode Scanner</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5f6b7a;
+      --line: #dde2e8; --accent: #0b6bcb; --accent-text: #ffffff; --ok: #1a7f37; --warn: #b35900;
+      --box: #22c55e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #9aa5b1;
+        --line: #2a313a; --accent: #4c9dff; --accent-text: #0b0e12; --ok: #4ade80; --warn: #fbbf24;
+      }
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 760px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+    .viewer { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: 12px; overflow: hidden; }
+    .viewer video, .viewer canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .viewer .guide { position: absolute; inset: 18% 12%; border: 2px solid rgba(255,255,255,.8);
+      border-radius: 10px; pointer-events: none; box-shadow: 0 0 0 9999px rgba(0,0,0,.28); }
+    .viewer canvas { cursor: crosshair; }
+    .stats { position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,.6); color: #fff;
+      font-size: 11px; padding: 2px 8px; border-radius: 999px; font-variant-numeric: tabular-nums; }
+    label.zoom { display: flex; align-items: center; gap: 8px; font-size: 14px; flex: 1 1 200px; }
+    label.zoom input { flex: 1; }
+    .viewer .idle { position: absolute; inset: 0; display: grid; place-items: center; color: #cfd6de;
+      font-size: 14px; text-align: center; padding: 16px; }
+    .badge { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,.6); color: #fff;
+      font-size: 12px; padding: 3px 8px; border-radius: 999px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
+    button, select, label.file {
+      font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+      border-radius: 8px; padding: 8px 12px; cursor: pointer; min-height: 40px;
+    }
+    button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    select { max-width: 100%; flex: 1 1 180px; }
+    label.file input { display: none; }
+    details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin-bottom: 12px; }
+    summary { cursor: pointer; font-weight: 600; }
+    .formats { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 0 4px; }
+    .formats label, .opts label { font-size: 14px; white-space: nowrap; }
+    .opts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; }
+    #error { color: var(--warn); min-height: 1.4em; margin: 0 0 8px; font-size: 14px; }
+    ul#results { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+    #results li { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+    .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .fmt { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+    .val { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; margin: 4px 0 0; }
+    .copy { padding: 4px 10px; min-height: 0; font-size: 13px; }
+    table.gs1 { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+    table.gs1 td { border-top: 1px solid var(--line); padding: 4px 6px 4px 0; vertical-align: top; }
+    table.gs1 td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+    .ok { color: var(--ok); } .bad { color: var(--warn); }
+    .empty { color: var(--muted); font-size: 14px; }
+    #diag { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap;
+      word-break: break-all; margin: 10px 0; max-height: 50vh; overflow: auto; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Barcode Scanner</h1>
+  <p class="sub">QR, Data Matrix (incl. GS1), EAN/UPC, Code 128 and more. Decoding runs on this device; the camera image never leaves the browser.</p>
+
+  <div class="viewer">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="guide" hidden id="guide"></div>
+    <div class="idle" id="idle"><span>Press <b>Start camera</b> to scan, or scan an image file.</span></div>
+    <span class="badge" id="engine" hidden></span>
+    <span class="stats" id="stats" hidden></span>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="toggle">Start camera</button>
+    <select id="camera" aria-label="Camera" disabled><option value="">Default (rear) camera</option></select>
+    <button id="torch" hidden>Torch</button>
+    <label class="zoom" id="zoomWrap" hidden>Zoom <input type="range" id="zoom" min="1" max="1" step="0.1" value="1"></label>
+    <label class="file">Scan image…<input type="file" id="file" accept="image/*"></label>
+  </div>
+
+  <details>
+    <summary>Settings</summary>
+    <div class="formats" id="formats"></div>
+    <div class="opts">
+      <label><input type="checkbox" id="continuous" checked> Continuous</label>
+      <label><input type="checkbox" id="beep" checked> Beep</label>
+      <label><input type="checkbox" id="vibrate" checked> Vibrate</label>
+      <label><input type="checkbox" id="forceZxing"> Always use ZXing engine</label>
+    </div>
+    <p class="sub" style="margin:8px 0 0">Tap the preview to focus. Codes inside the box are decoded at full camera resolution; 1D barcodes must be read in two frames before they are reported.</p>
+  </details>
+
+  <details>
+    <summary>Diagnostics</summary>
+    <pre id="diag">Start the camera to see what the scanner is doing.</pre>
+    <div class="controls" style="margin:0">
+      <button id="copyDiag">Copy diagnostics</button>
+      <button id="saveFrame">Save camera frame</button>
+    </div>
+  </details>
+
+  <p id="error" role="alert"></p>
+  <ul id="results" aria-live="polite"><li class="empty">No codes scanned yet.</li></ul>
+</main>
+
+<script type="module">
+  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=c6f5898-202611080111';
+  import { parseGS1 } from './gs1.js?v=c6f5898-202611080111';
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
+  const DEFAULT_ON = ['qr_code', 'data_matrix', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'];
+  const GS1_CAPABLE = new Set(['data_matrix', 'code_128', 'qr_code', 'databar', 'databar_expanded', 'databar_limited']);
+
+  // Format checkboxes
+  for (const f of COMMON_FORMATS) {
+    const l = document.createElement('label');
+    l.innerHTML = `<input type="checkbox" value="${f}" ${DEFAULT_ON.includes(f) ? 'checked' : ''}> ${f}`;
+    $('formats').append(l);
+  }
+  const selectedFormats = () => [...$('formats').querySelectorAll('input:checked')].map((i) => i.value);
+
+  // Map the on-screen target box to video pixels (the video uses object-fit: cover).
+  function coverMapping() {
+    const r = video.getBoundingClientRect(), vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.max(r.width / vw, r.height / vh);
+    return { r, s, ox: (r.width - vw * s) / 2, oy: (r.height - vh * s) / 2 };
+  }
+  function guideRegion() {
+    if (!video.videoWidth || $('guide').hidden) return null;
+    const { r, s, ox, oy } = coverMapping(), g = $('guide').getBoundingClientRect();
+    return { x: (g.left - r.left - ox) / s, y: (g.top - r.top - oy) / s, width: g.width / s, height: g.height / s };
+  }
+
+  const scanner = new BarcodeScanner(video, {
+    formats: selectedFormats(),
+    getRegion: guideRegion,
+    onDetect: (codes) => codes.forEach(report),
+    onError: (err) => showError(err),
+  });
+
+  const ENGINE_LABEL = { hybrid: 'Android + ZXing engines', native: 'Android engine', zxing: 'ZXing engine' };
+  const savedCamera = () => { try { return localStorage.getItem('scanner.camera') || ''; } catch { return ''; } };
+  const saveCamera = (id) => { try { localStorage.setItem('scanner.camera', id); } catch { /* storage unavailable */ } };
+
+  function showError(err) { $('error').textContent = err ? (err.message || String(err)) : ''; }
+
+  async function start() {
+    showError();
+    scanner.options.formats = selectedFormats();
+    scanner.options.continuous = $('continuous').checked;
+    scanner.options.engine = $('forceZxing').checked ? 'zxing' : 'auto';
+    scanner.options.deviceId = savedCamera() || undefined;
+    $('toggle').disabled = true;
+    try {
+      try {
+        await scanner.start();
+      } catch (err) {
+        if (!scanner.options.deviceId || err.name === 'NotAllowedError') throw err;
+        saveCamera(''); // remembered camera is gone: fall back to automatic choice
+        scanner.options.deviceId = undefined;
+        await scanner.start();
+      }
+      await fillCameras();
+      $('engine').textContent = ENGINE_LABEL[scanner.engine.name] ?? scanner.engine.name;
+      $('engine').hidden = false;
+      setupCameraControls();
+      if (scanner.autoSwitched) {
+        saveCamera(scanner.autoSwitched.deviceId);
+        await fillCameras();
+        showError(new Error(`Switched to ${scanner.autoSwitched.to}: ${scanner.autoSwitched.from} has no autofocus. You can pick it again from the list.`));
+      } else if (scanner.autofocus === false) {
+        const checked = (scanner.cameraReport || []).length > 1;
+        showError(new Error(checked
+          ? 'This camera has no autofocus, so barcodes up close will look blurry, and none of the other back cameras has autofocus either. Hold the code a little further away.'
+          : 'This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
+      }
+      $('idle').hidden = true; $('guide').hidden = false;
+      drawLoop();
+    } catch (err) {
+      showError(err.name === 'NotAllowedError' ? new Error('Camera permission was denied.') : err);
+      scanner.stop();
+    } finally {
+      $('toggle').disabled = false;
+      syncUi();
+    }
+  }
+
+  function setupCameraControls() {
+    $('torch').hidden = !scanner.torchSupported;
+    const z = scanner.zoomRange;
+    $('zoomWrap').hidden = !z;
+    if (z) {
+      const zoom = $('zoom');
+      zoom.min = z.min; zoom.max = Math.min(z.max, z.min * 8); zoom.step = z.step || 0.1;
+      zoom.value = scanner.track.getSettings().zoom ?? z.min;
+    }
+  }
+
+  function stop() {
+    scanner.stop();
+    $('zoomWrap').hidden = true; $('stats').hidden = true; $('engine').hidden = true;
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    $('idle').hidden = false; $('guide').hidden = true; $('torch').hidden = true;
+    syncUi();
+  }
+
+  function syncUi() {
+    $('toggle').textContent = scanner.running ? 'Stop camera' : 'Start camera';
+    $('camera').disabled = !scanner.running;
+    if (!scanner.running) { $('idle').hidden = false; $('guide').hidden = true; }
+  }
+
+  async function fillCameras() {
+    const cams = await BarcodeScanner.listCameras();
+    const sel = $('camera');
+    const current = scanner.track?.getSettings().deviceId;
+    sel.innerHTML = '';
+    cams.forEach((c, i) => sel.add(new Option(c.label || `Camera ${i + 1}`, c.deviceId, false, c.deviceId === current)));
+    if (!cams.length) sel.add(new Option('Default camera', ''));
+  }
+
+  // Draw the outlines of the codes currently in view. The video uses object-fit: cover,
+  // so map video pixels to element pixels with the same scale + offset.
+  let statsAt = 0;
+  function drawLoop() {
+    if (!scanner.running) return;
+    const tNow = performance.now();
+    if (tNow - statsAt > 1000) {
+      statsAt = tNow;
+      const f = scanner.stats.frames;
+      $('stats').textContent = f
+        ? `${f} frames/s · ${(scanner.stats.decodeMs / f).toFixed(0)} ms each · ${video.videoWidth}×${video.videoHeight}`
+        : `waiting for frames · ${video.videoWidth}×${video.videoHeight}`;
+      $('stats').hidden = false;
+      scanner.stats.frames = 0; scanner.stats.decodeMs = 0;
+      $('diag').textContent = JSON.stringify(scanner.diagnostics(), null, 2);
+    }
+    const r = overlay.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+    if (overlay.width !== Math.round(r.width * dpr)) { overlay.width = Math.round(r.width * dpr); overlay.height = Math.round(r.height * dpr); }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (vw && scanner.lastResults.length) {
+      const s = Math.max(overlay.width / vw, overlay.height / vh);
+      const ox = (overlay.width - vw * s) / 2, oy = (overlay.height - vh * s) / 2;
+      ctx.lineWidth = 3 * dpr; ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--box');
+      for (const c of scanner.lastResults) {
+        ctx.beginPath();
+        c.cornerPoints.forEach((p, i) => ctx[i ? 'lineTo' : 'moveTo'](ox + p.x * s, oy + p.y * s));
+        ctx.closePath(); ctx.stroke();
+      }
+    }
+    requestAnimationFrame(drawLoop);
+  }
+
+  let audio;
+  function feedback() {
+    if ($('vibrate').checked) navigator.vibrate?.(60);
+    if (!$('beep').checked) return;
+    try {
+      audio ??= new AudioContext();
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = 1400; g.gain.value = 0.08;
+      o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime + 0.09);
+    } catch { /* audio not available */ }
+  }
+
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const visible = (s) => s.replace(/\u001d/g, '<GS>');
+
+  function report(code) {
+    feedback();
+    const list = $('results');
+    list.querySelector('.empty')?.remove();
+    const li = document.createElement('li');
+    const gs1 = code.isGS1 || GS1_CAPABLE.has(code.format) ? parseGS1(code.rawValue) : null;
+    let table = '';
+    if (gs1) {
+      table = '<table class="gs1">' + gs1.elements.map((e) => {
+        let extra = '';
+        if (e.date) extra = ` <span class="fmt">${e.date}</span>`;
+        if (e.valid !== undefined) extra = e.valid ? ' <span class="ok">✓</span>' : ' <span class="bad">check digit invalid</span>';
+        if (e.number !== undefined) extra = ` <span class="fmt">= ${e.number}</span>`;
+        return `<tr><td>(${e.ai}) ${esc(e.title)}</td><td>${esc(e.value)}${extra}</td></tr>`;
+      }).join('') + '</table>';
+    }
+    li.innerHTML = `
+      <div class="row"><span class="fmt">${esc(code.format)}${gs1 ? ' · GS1' : ''} · ${new Date().toLocaleTimeString()}</span>
+        <button class="copy">Copy</button></div>
+      <p class="val">${esc(visible(code.rawValue))}</p>${table}`;
+    li.querySelector('.copy').onclick = () => navigator.clipboard?.writeText(code.rawValue);
+    list.prepend(li);
+    if (!scanner.running) syncUi();
+  }
+
+  $('toggle').onclick = () => (scanner.running ? stop() : start());
+  $('camera').onchange = async (e) => {
+    saveCamera(e.target.value);
+    try {
+      await scanner.switchCamera(e.target.value);
+      showError(scanner.autofocus ? null : new Error('This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
+      setupCameraControls(); drawLoop();
+    }
+    catch (err) { showError(err); syncUi(); }
+  };
+  $('copyDiag').onclick = () => {
+    const text = $('diag').textContent;
+    navigator.clipboard?.writeText(text).catch(() => {
+      const r = document.createRange(); r.selectNodeContents($('diag'));
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    });
+  };
+  $('saveFrame').onclick = async () => {
+    const blob = scanner.running ? await scanner.captureFrame() : null;
+    if (!blob) { showError(new Error('Start the camera first, then point it at the barcode and tap Save camera frame.')); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `scanner-frame-${video.videoWidth}x${video.videoHeight}-${Date.now()}.png`;
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  };
+  $('zoom').oninput = (e) => scanner.setZoom(Number(e.target.value)).catch(showError);
+  overlay.onclick = (e) => {
+    if (!scanner.running || !video.videoWidth) return;
+    const { r, s, ox, oy } = coverMapping();
+    const x = (e.clientX - r.left - ox) / s / video.videoWidth, y = (e.clientY - r.top - oy) / s / video.videoHeight;
+    scanner.focusAt(Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y)));
+  };
+  let torchOn = false;
+  $('torch').onclick = async () => { torchOn = !torchOn; await scanner.setTorch(torchOn).catch(showError); };
+  $('formats').onchange = () => scanner.setFormats(selectedFormats()).catch(showError);
+  $('continuous').onchange = (e) => { scanner.options.continuous = e.target.checked; };
+  $('file').onchange = async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    showError();
+    try {
+      const codes = await scanImage(file, {
+        formats: selectedFormats(),
+        engine: $('forceZxing').checked ? 'zxing' : 'auto',
+      });
+      if (!codes.length) showError(new Error('No barcode found in that image.'));
+      codes.forEach(report);
+    } catch (err) { showError(err); }
+  };
+  // Stop the camera when the tab is hidden, to free it for other apps.
+  document.addEventListener('visibilitychange', () => { if (document.hidden && scanner.running) stop(); });
+</script>
+</body>
+</html>
