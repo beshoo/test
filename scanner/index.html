@@ -116,8 +116,8 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, VERSION, scanImage } from './scanner.js?v=9fccbc3-202611081635';
-  import { parseGS1 } from './gs1.js?v=9fccbc3-202611081635';
+  import { BarcodeScanner, COMMON_FORMATS, VERSION, scanImage } from './scanner.js?v=e8ef9f3-202611081650';
+  import { parseGS1 } from './gs1.js?v=e8ef9f3-202611081650';
 
   const $ = (id) => document.getElementById(id);
   $('version').textContent = `Version ${VERSION.label}`;
@@ -152,6 +152,8 @@
     onDetect: (codes) => codes.forEach(report),
     onError: (err) => showError(err),
   });
+  // Load the decoder now, so "Start camera" only has to open the camera.
+  BarcodeScanner.preload(selectedFormats());
 
   const ENGINE_LABEL = { hybrid: 'Android + ZXing engines', native: 'Android engine', zxing: 'ZXing engine' };
   const savedCamera = () => { try { return localStorage.getItem('scanner.camera') || ''; } catch { return ''; } };

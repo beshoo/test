@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=9fccbc3-202611081635';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=e8ef9f3-202611081650';
 
 /**
  * Build stamp from this module's own URL (stamp-version.sh adds ?v=<commit>-<YYYYMMDDHHMM>),
@@ -80,11 +80,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=9fccbc3-202611081635', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=e8ef9f3-202611081650', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=9fccbc3-202611081635', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=e8ef9f3-202611081650', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -374,28 +374,40 @@ export class BarcodeScanner {
     if (this._running) return;
     if (!window.isSecureContext) throw new Error('Camera access requires HTTPS (or localhost).');
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser has no camera API.');
+    const t0 = performance.now();
+    const timing = (this.startTiming = {});
 
-    this.engine = await createEngine(this.options.formats, this.options.engine);
+    // The decoder (WebAssembly download + compile) loads while the camera opens;
+    // the preview shows as soon as the camera is ready, scanning once both are.
+    const engineReady = createEngine(this.options.formats, this.options.engine);
+    engineReady.catch(() => {}); // awaited below; don't report it as unhandled meanwhile
 
-    const which = this.options.deviceId
-      ? { deviceId: { exact: this.options.deviceId } }
-      : { facingMode: { ideal: 'environment' } };
     const constraints = (w) => ({
       audio: false,
       video: { ...w, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
     });
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
+    // With camera permission from an earlier visit, labels are readable now: open the
+    // main back camera directly instead of opening the default one and switching.
+    let deviceId = this.options.deviceId;
+    if (!deviceId) deviceId = chooseBackCamera(await BarcodeScanner.listCameras().catch(() => []))?.deviceId || undefined;
+    const which = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
+    this.stream = await navigator.mediaDevices.getUserMedia(constraints(which)).catch((err) => {
+      if (this.options.deviceId || !deviceId || err.name === 'NotAllowedError') throw err;
+      return navigator.mediaDevices.getUserMedia(constraints({ facingMode: { ideal: 'environment' } }));
+    });
+    timing.cameraOpenMs = Math.round(performance.now() - t0);
 
     // Labels are only readable after permission: now switch to the main back camera if needed.
     this.autoSwitched = null;
     this.cameraReport = [];
     try {
-      if (!this.options.deviceId) {
+      if (!this.options.deviceId && !deviceId) { // opened the default camera: is it the main one?
         const best = chooseBackCamera(await BarcodeScanner.listCameras());
         const current = this.track?.getSettings?.().deviceId;
         if (best && best.deviceId && best.deviceId !== current) {
           this.stream.getTracks().forEach((t) => t.stop());
           this.stream = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: best.deviceId } }));
+          timing.cameraSwitchedMs = Math.round(performance.now() - t0);
         }
       }
       // A camera without autofocus (often an ultra-wide or macro lens) gives soft
@@ -435,6 +447,15 @@ export class BarcodeScanner {
 
     this.video.srcObject = this.stream;
     await this.video.play();
+    timing.previewMs = Math.round(performance.now() - t0);
+    try {
+      this.engine = await engineReady;
+    } catch (err) {
+      this.stop();
+      throw err;
+    }
+    if (!this.stream) return; // stop() was called while the decoder was loading
+    timing.scanningMs = Math.round(performance.now() - t0);
     this._begin();
   }
 
@@ -494,6 +515,14 @@ export class BarcodeScanner {
   }
 
   /** Change the formats being scanned for. */
+  /**
+   * Load the decoder in the background (e.g. on page load), so start() only has
+   * to open the camera. Safe to call more than once.
+   */
+  static preload(formats = [], engine = 'auto') {
+    return createEngine(formats, engine).catch(() => null);
+  }
+
   async setFormats(formats) {
     this.options.formats = formats;
     if (this._running) this.engine = await createEngine(formats, this.options.engine);
@@ -509,6 +538,7 @@ export class BarcodeScanner {
       engineHits: this.engine?.hits ?? null,
       nativeRetired: this.engine?.nativeOff ?? null,
       parallelWorkers: (this.engine?.zxing ?? this.engine)?.parallel ?? null,
+      startTiming: this.startTiming ?? null,
       firstSeenMs: this.firstSeenMs,
       firstReadMs: this.firstReadMs,
       lastConfirm: this.lastConfirm ?? null,
