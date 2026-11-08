@@ -111,8 +111,8 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js';
-  import { parseGS1 } from './gs1.js';
+  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=ea7b05a-202611080003';
+  import { parseGS1 } from './gs1.js?v=ea7b05a-202611080003';
 
   const $ = (id) => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
