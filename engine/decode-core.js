@@ -43,7 +43,7 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
-import { decodeEanGrey } from './ean-grey.js?v=9b5d238-202611080034';
+import { decodeEanGrey } from './ean-grey.js?v=3850c10-202611080044';
 
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',
@@ -202,13 +202,15 @@ export function createDecoder(readBarcodes) {
    * @param {{data: Uint8ClampedArray, width: number, height: number}} img RGBA pixels
    * @param {{formats?: string[], strategy?: number, offset?: {x:number,y:number}}} [opts]
    */
-  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true } = {}) {
+  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true, tryRotate } = {}) {
     const s = STRATEGIES[strategy % STRATEGIES.length];
     const zxFormats = formats.map((f) => FORMAT_TO_ZXING[f]).filter(Boolean);
     let input = img;
     if (s.prep === 'stretch') input = contrastStretch(copyImage(img));
     else if (s.prep === 'sharpen') input = sharpen(copyImage(img));
-    const results = zxing ? await readBarcodes(input, { ...BASE, ...s.options, formats: zxFormats }) : [];
+    const zopts = { ...BASE, ...s.options, formats: zxFormats };
+    if (tryRotate === false) zopts.tryRotate = false; // the caller knows a rotation search is not needed this pass
+    const results = zxing ? await readBarcodes(input, zopts) : [];
     const found = arbitrate(results.filter((r) => r.isValid).map((r) => ({ ...normalize(r, offset), strategy: s.name })));
     // ZXing binarizes first, which loses thin bars on soft images. If it found no
     // retail code, try the greyscale EAN/UPC reader (edge + blur-model decoding).

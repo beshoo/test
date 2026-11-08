@@ -6,7 +6,7 @@
  * Messages out: { id, results } | { id, error }
  */
 import { prepareZXingModule, readBarcodes } from '../vendor/zxing-wasm/reader/index.js';
-import { createDecoder } from './decode-core.js?v=9b5d238-202611080034';
+import { createDecoder } from './decode-core.js?v=3850c10-202611080044';
 
 const wasmDir = new URL('../vendor/zxing-wasm/reader/', import.meta.url);
 
@@ -31,7 +31,7 @@ self.onmessage = async ({ data: msg }) => {
   }
   try {
     await ready;
-    const opts = { formats: msg.formats, strategy: msg.strategy, offset: msg.offset, greyEan: msg.greyEan !== false, zxing: msg.zxing !== false };
+    const opts = { formats: msg.formats, strategy: msg.strategy, offset: msg.offset, greyEan: msg.greyEan !== false, zxing: msg.zxing !== false, tryRotate: msg.tryRotate };
     const results = msg.all ? await decoder.decodeAll(msg.image, opts) : await decoder.decodeOnce(msg.image, opts);
     self.postMessage({ id: msg.id, results });
   } catch (err) {

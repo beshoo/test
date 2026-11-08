@@ -69,7 +69,7 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 ## Speed
 
 - **Two workers in parallel** on multi-core devices: ZXing in `engine/worker.js`, the greyscale EAN/UPC reader in `engine/grey-worker.js`. A full-resolution frame costs the slower of the two, not their sum.
-- **Strong retail reads are reported at once.** An EAN/UPC whose check digit passed and that many scan lines agree on (≥ 3 greyscale lines, or ≥ 12 ZXing lines) skips the second confirming frame.
+- **1D codes are voted across frames.** EAN check digits pass for 1 wrong code in 10, so every 1D read is a vote kept for 2 s. A value needs 2 votes (3 if only the greyscale reader sees it). If a different 1D value was also seen, it needs at least twice the votes of every rival. Only a ZXing read backed by ≥ 12 scan lines, with no rival, is reported at once. (Added after a phone reported `9277146613147` for `6211136613147`, which had briefly been allowed through on a single frame.)
 - **A built-in detector that never reads is retired.** If `BarcodeDetector` has found nothing after 30 frames while ZXing has read at least 3, it is no longer called.
 - **The box gets priority.** While codes keep turning up in the target box, it is decoded 3 frames out of 4 at full resolution.
 - **Templates are built at start-up** (`warmUp()`, in the worker), not on the first frames.
