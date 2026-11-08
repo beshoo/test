@@ -43,6 +43,8 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
+import { decodeEanGrey } from './ean-grey.js?v=1ad4166-202611080027';
+
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',
   'databar', 'databar_expanded', 'databar_limited',
@@ -51,7 +53,7 @@ export const LINEAR_FORMATS = new Set([
 const BASE = {
   tryHarder: true,
   tryRotate: true,
-  tryInvert: true,
+  tryInvert: false, // white-on-black codes are rare: only the contrast-stretch step looks for them
   tryDownscale: true,
   textMode: 'Plain', // keep GS1 FNC1 separators as \x1d
   maxNumberOfSymbols: 8,
@@ -65,7 +67,7 @@ export const STRATEGIES = [
   { name: 'local-average', options: { binarizer: 'LocalAverage' } },
   { name: 'sharpen', options: { binarizer: 'LocalAverage' }, prep: 'sharpen' },
   { name: 'global-histogram', options: { binarizer: 'GlobalHistogram' } },
-  { name: 'contrast-stretch', options: { binarizer: 'LocalAverage' }, prep: 'stretch' },
+  { name: 'contrast-stretch', options: { binarizer: 'LocalAverage', tryInvert: true }, prep: 'stretch' },
   { name: 'denoise', options: { binarizer: 'LocalAverage', tryDenoise: true } },
 ];
 
@@ -162,6 +164,9 @@ function normalize(r, offset) {
   };
 }
 
+const RETAIL = new Set(['ean_13', 'ean_8', 'upc_a', 'upc_e']);
+const formatsAllowRetail = (formats) => !formats.length || formats.some((f) => f === 'ean_13' || f === 'ean_8' || f === 'upc_a');
+
 function overlaps(a, b) {
   const ax2 = a.x + a.width, ay2 = a.y + a.height, bx2 = b.x + b.width, by2 = b.y + b.height;
   const iw = Math.min(ax2, bx2) - Math.max(a.x, b.x), ih = Math.min(ay2, by2) - Math.max(a.y, b.y);
@@ -197,24 +202,43 @@ export function createDecoder(readBarcodes) {
    * @param {{data: Uint8ClampedArray, width: number, height: number}} img RGBA pixels
    * @param {{formats?: string[], strategy?: number, offset?: {x:number,y:number}}} [opts]
    */
-  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 } } = {}) {
+  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true } = {}) {
     const s = STRATEGIES[strategy % STRATEGIES.length];
     const zxFormats = formats.map((f) => FORMAT_TO_ZXING[f]).filter(Boolean);
     let input = img;
     if (s.prep === 'stretch') input = contrastStretch(copyImage(img));
     else if (s.prep === 'sharpen') input = sharpen(copyImage(img));
-    const results = await readBarcodes(input, { ...BASE, ...s.options, formats: zxFormats });
-    const found = results.filter((r) => r.isValid).map((r) => ({ ...normalize(r, offset), strategy: s.name }));
-    return arbitrate(found);
+    const results = zxing ? await readBarcodes(input, { ...BASE, ...s.options, formats: zxFormats }) : [];
+    const found = arbitrate(results.filter((r) => r.isValid).map((r) => ({ ...normalize(r, offset), strategy: s.name })));
+    // ZXing binarizes first, which loses thin bars on soft images. If it found no
+    // retail code, try the greyscale EAN/UPC reader (edge + blur-model decoding).
+    if (greyEan && !found.some((r) => RETAIL.has(r.format)) && formatsAllowRetail(formats)) {
+      for (const g of decodeEanGrey(img, formats)) {
+        const pts = g.cornerPoints.map((q) => ({ x: q.x + offset.x, y: q.y + offset.y }));
+        const xs = pts.map((q) => q.x), ys = pts.map((q) => q.y);
+        found.push({
+          rawValue: g.rawValue,
+          format: g.format,
+          symbologyIdentifier: g.format === 'ean_8' ? ']E4' : ']E0',
+          isGS1: false,
+          lineCount: g.lines,
+          cornerPoints: pts,
+          boundingBox: { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) },
+          strategy: 'greyscale-ean',
+        });
+      }
+    }
+    return found;
   }
 
   /** Try every strategy until one finds something (for still images). */
   async function decodeAll(img, opts = {}) {
     for (let i = 0; i < STRATEGIES.length; i += 1) {
-      const found = await decodeOnce(img, { ...opts, strategy: i });
+      const found = await decodeOnce(img, { ...opts, strategy: i, greyEan: false });
       if (found.length) return found;
     }
-    return [];
+    // the greyscale reader does not depend on the ZXing strategy: run it once
+    return opts.greyEan === false ? [] : decodeOnce(img, { ...opts, strategy: 0, greyEan: true, zxing: false });
   }
 
   return { decodeOnce, decodeAll };

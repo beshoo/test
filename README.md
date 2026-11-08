@@ -4,6 +4,11 @@ A browser camera scanner for QR, GS1 Data Matrix, EAN/UPC, Code 128 and more. Ev
 
 - **Engine:** ZXing-C++ compiled to WebAssembly ([zxing-wasm](https://github.com/Sec-ant/zxing-wasm) 3.1.3, MIT; vendored in `vendor/zxing-wasm/`), running in a Web Worker. Where the browser has a built-in `BarcodeDetector` (Chrome on Android: Google ML Kit), both engines run on every frame and the first read wins, so a device whose built-in detector returns nothing still scans.
 - **On top of ZXing:** full-resolution decoding of the target box, a preprocessing/binarizer ladder including sharpening, ghost-read arbitration and two-frame confirmation for 1D codes. On the benchmark this raises read rate from 54% to 64%, with 0 wrong values. Details and sources: [`../docs/scanner-research.md`](../docs/scanner-research.md).
+- **Greyscale EAN/UPC reader** (`engine/ean-grey.js`), our own decoder for retail barcodes, used whenever ZXing finds none. ZXing converts each scan line to pure black and white first, so on a soft image the thin white gaps between thick bars disappear. This reader never thresholds:
+  1. *Edge reader:* bar edges are taken from the brightness gradient at sub-pixel precision, so a blurred gap still shows up as a dip.
+  2. *Blur-model reader:* when edges merge, it locates only the barcode's two outer ends, maps the 95 modules across them (with perspective), estimates blur and bar thinning from the guard patterns, and decodes the digits by beam search. Each candidate digit is simulated next to its already-decoded neighbour, blurred, and compared with the brightness profile.
+
+  Acceptance requires a valid check digit and two agreeing scan lines, plus quality limits set from measurements (see the research doc). It reads a real phone frame of an EAN-13 that both ZXing and Android's ML Kit failed on.
 - **GS1 parsing** (`gs1.js`): GTIN with check-digit validation, expiry/production dates, batch/lot, serial, NHRN, measures.
 
 ## Run the demo
@@ -52,11 +57,13 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 |---|---|
 | `scanner.js` | Camera, frame loop, engine selection, confirmation, camera controls |
 | `engine/decode-core.js` | Strategy ladder, sharpening, contrast stretch, ghost arbitration (no DOM; also runs in Node) |
+| `engine/ean-grey.js` | Greyscale EAN-13 / UPC-A / EAN-8 reader: edge reader + blur-model beam-search reader |
 | `engine/worker.js` | Web Worker wrapper around the decoder |
 | `gs1.js` | GS1 element-string parser |
 | `index.html` | Demo UI |
 | `vendor/zxing-wasm/` | Vendored zxing-wasm 3.1.3 reader (+ `.wasm`, SHA-256 `2ebda08a…c6d1ba`), MIT |
 | `bench/` | Benchmark: `make-codes.mjs` → `make-frames.py` → `bench.mjs` |
+| `stamp-version.sh` | Adds `?v=` cache-busting versions to the module URLs. Run it after every change |
 
 ## Camera choice
 

@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=ea7b05a-202611080003';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=1ad4166-202611080027';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -37,7 +37,7 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!sharedWorker) {
-      const worker = new Worker(new URL('./engine/worker.js?v=ea7b05a-202611080003', import.meta.url), { type: 'module' });
+      const worker = new Worker(new URL('./engine/worker.js?v=1ad4166-202611080027', import.meta.url), { type: 'module' });
       const pending = new Map();
       let nextId = 1;
       worker.onmessage = ({ data }) => {
@@ -68,9 +68,9 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  decodeImage(image, { formats, strategy, offset, all = false }) {
+  decodeImage(image, { formats, strategy, offset, all = false, greyEan = true }) {
     const img = { data: image.data, width: image.width, height: image.height };
-    return this._w.call({ image: img, formats, strategy, offset, all }, [image.data.buffer]);
+    return this._w.call({ image: img, formats, strategy, offset, all, greyEan }, [image.data.buffer]);
   }
 
   /** @param {{canvas, ctx, width, height}} frame */
@@ -141,6 +141,13 @@ class HybridEngine {
     for (const r of nr) if (!out.some((o) => o.rawValue === r.rawValue)) out.push(r);
     return out;
   }
+}
+
+/** True when the camera reports continuous or single-shot autofocus (unknown = assume yes). */
+function hasAutofocus(track) {
+  const modes = track?.getCapabilities?.().focusMode;
+  if (!Array.isArray(modes)) return true; // browser does not report focus (e.g. Safari): don't second-guess it
+  return modes.includes('continuous') || modes.includes('single-shot');
 }
 
 async function nativeSupports(formats) {
@@ -320,10 +327,28 @@ export class BarcodeScanner {
           this.stream.getTracks().forEach((t) => t.stop());
           this.stream = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: best.deviceId } }));
         }
+        // A camera without autofocus (often an ultra-wide or macro lens) gives soft
+        // images at barcode distance. Probe the other back cameras for one that has it.
+        if (!hasAutofocus(this.track)) {
+          const others = (await BarcodeScanner.listCameras())
+            .filter((d) => /back|rear|environment/i.test(d.label) && d.deviceId !== this.track?.getSettings?.().deviceId)
+            .slice(0, 4);
+          for (const d of others) {
+            const probe = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: d.deviceId } })).catch(() => null);
+            if (!probe) continue;
+            if (hasAutofocus(probe.getVideoTracks()[0])) {
+              this.stream.getTracks().forEach((t) => t.stop());
+              this.stream = probe;
+              break;
+            }
+            probe.getTracks().forEach((t) => t.stop());
+          }
+        }
       } catch {
         if (!this.stream?.active) this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
       }
     }
+    this.autofocus = hasAutofocus(this.track);
 
     // Continuous autofocus where the device allows it.
     const caps = this.capabilities;
@@ -380,6 +405,7 @@ export class BarcodeScanner {
       resolution: st.width ? `${st.width}x${st.height} @ ${Math.round(st.frameRate || 0)}fps` : null,
       video: this.video.videoWidth ? `${this.video.videoWidth}x${this.video.videoHeight}` : null,
       focusMode: st.focusMode ?? null,
+      autofocus: this.autofocus ?? null,
       focusModes: caps.focusMode ?? null,
       zoom: caps.zoom ? `${st.zoom ?? '?'} (${caps.zoom.min}-${caps.zoom.max})` : null,
       torch: Boolean(caps.torch),
@@ -479,10 +505,11 @@ export class BarcodeScanner {
     const strategy = Math.floor(pass / (needsDownscale ? 2 : 1)) % STRATEGIES.length;
     if (roiPass) {
       const r = this._region(vw, vh);
-      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy };
+      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true };
     }
     const scale = Math.min(1, this.options.maxDecodeSize / Math.max(vw, vh));
-    return { sx: 0, sy: 0, sw: vw, sh: vh, scale, strategy };
+    // without a separate region pass (small video), the whole frame is full resolution
+    return { sx: 0, sy: 0, sw: vw, sh: vh, scale, strategy, greyEan: !needsDownscale };
   }
 
   async _tick() {
@@ -510,7 +537,7 @@ export class BarcodeScanner {
       const engine = this.engine;
       const frame = { canvas: this._canvas, ctx: this._ctx, width: w, height: h };
       const t0 = performance.now();
-      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy });
+      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan });
       const dt = performance.now() - t0;
       this.stats.frames += 1;
       this.stats.decodeMs += dt;
