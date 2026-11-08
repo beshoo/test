@@ -17,7 +17,17 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=c2abae2-202611081631';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=9fccbc3-202611081635';
+
+/**
+ * Build stamp from this module's own URL (stamp-version.sh adds ?v=<commit>-<YYYYMMDDHHMM>),
+ * shown on the pages so a phone can be checked for the latest version.
+ */
+export const VERSION = (() => {
+  const v = new URL(import.meta.url).searchParams.get('v') || 'dev';
+  const m = v.match(/^(\w+)-(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)$/);
+  return m ? { label: `${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]}`, stamp: v } : { label: v, stamp: v };
+})();
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -70,11 +80,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=c2abae2-202611081631', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=9fccbc3-202611081635', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=c2abae2-202611081631', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=9fccbc3-202611081635', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;

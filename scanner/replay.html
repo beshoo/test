@@ -20,6 +20,8 @@
       font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     main { max-width: 900px; margin: 0 auto; padding: 16px; }
     h1 { font-size: 20px; margin: 0 0 4px; }
+    .version { font-size: 12px; font-weight: 500; color: var(--muted); border: 1px solid var(--line);
+      border-radius: 999px; padding: 1px 8px; vertical-align: middle; white-space: nowrap; }
     .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
     video { width: 100%; max-height: 50vh; background: #000; border-radius: 12px; }
     .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
@@ -43,7 +45,7 @@
 </head>
 <body>
 <main>
-  <h1>Scanner replay</h1>
+  <h1>Scanner replay <span class="version" id="version"></span></h1>
   <p class="sub">Record short clips with the phone's camera app (start with the code out of view or out of focus, then aim at it), then replay them here. "Real time" plays at normal speed on this device, like live scanning. "Every frame" decodes 15 frames per video second, whatever this device's speed, to measure what is readable.</p>
 
   <video id="video" muted playsinline></video>
@@ -73,9 +75,11 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner } from './scanner.js?v=c2abae2-202611081631';
+  import { BarcodeScanner, VERSION } from './scanner.js?v=9fccbc3-202611081635';
 
   const $ = (id) => document.getElementById(id);
+  $('version').textContent = `Version ${VERSION.label}`;
+  $('version').title = VERSION.stamp;
   const video = $('video');
   const FORMATS = ['qr_code', 'data_matrix', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'];
   const STEP = 1 / 15;
@@ -97,7 +101,7 @@
     syncButtons();
   };
   $('run').onclick = runAll;
-  $('copy').onclick = () => navigator.clipboard.writeText(JSON.stringify({ userAgent: navigator.userAgent, results }, null, 2));
+  $('copy').onclick = () => navigator.clipboard.writeText(JSON.stringify({ version: VERSION.stamp, userAgent: navigator.userAgent, results }, null, 2));
 
   function syncButtons() {
     $('run').disabled = !clips.length;

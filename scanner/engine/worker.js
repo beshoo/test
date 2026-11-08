@@ -6,7 +6,7 @@
  * Messages out: { id, results } | { id, error }
  */
 import { prepareZXingModule, readBarcodes } from '../vendor/zxing-wasm/reader/index.js';
-import { createDecoder } from './decode-core.js?v=c2abae2-202611081631';
+import { createDecoder } from './decode-core.js?v=9fccbc3-202611081635';
 
 const wasmDir = new URL('../vendor/zxing-wasm/reader/', import.meta.url);
 
