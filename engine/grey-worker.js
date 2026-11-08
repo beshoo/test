@@ -3,11 +3,11 @@
  * with ZXing in worker.js, so a full-resolution frame costs max(ZXing, greyscale)
  * instead of their sum. Loads no WebAssembly.
  *
- * Messages in:  { id, type: 'ping' } | { id, image, formats, offset }
+ * Messages in:  { id, type: 'ping' } | { id, image, formats, offset, locate, greyFallback }
  * Messages out: { id, results } | { id, error }
  */
-import { createDecoder } from './decode-core.js?v=c6f5898-202611080111';
-import { warmUp } from './ean-grey.js?v=c6f5898-202611080111';
+import { createDecoder } from './decode-core.js?v=f73d8bf-202611081555';
+import { warmUp } from './ean-grey.js?v=f73d8bf-202611081555';
 
 const decoder = createDecoder(async () => []); // ZXing is never called here (zxing: false)
 
@@ -19,7 +19,7 @@ self.onmessage = async ({ data: msg }) => {
       return;
     }
     const results = await decoder.decodeOnce(msg.image, {
-      formats: msg.formats, offset: msg.offset, zxing: false, greyEan: true,
+      formats: msg.formats, offset: msg.offset, zxing: false, greyEan: true, locate: msg.locate, greyFallback: msg.greyFallback !== false,
     });
     self.postMessage({ id: msg.id, results });
   } catch (err) {

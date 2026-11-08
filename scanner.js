@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=c6f5898-202611080111';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=f73d8bf-202611081555';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=c6f5898-202611080111', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=f73d8bf-202611081555', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=c6f5898-202611080111', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=f73d8bf-202611081555', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -85,16 +85,16 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true, tryRotate }) {
+  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true, tryRotate, locate, fallback, greyFallback }) {
     const img = { data: image.data, width: image.width, height: image.height };
     if (!greyEan || all || !this._g) {
-      return this._w.call({ image: img, formats, strategy, offset, all, greyEan, tryRotate }, [image.data.buffer]);
+      return this._w.call({ image: img, formats, strategy, offset, all, greyEan, tryRotate, locate, fallback, greyFallback }, [image.data.buffer]);
     }
     // Parallel: ZXing in one worker, the greyscale reader in the other (on a copy).
     const copy = { data: new Uint8ClampedArray(image.data), width: image.width, height: image.height };
     const [z, g] = await Promise.allSettled([
-      this._w.call({ image: img, formats, strategy, offset, greyEan: false, tryRotate }, [image.data.buffer]),
-      this._g.call({ image: copy, formats, offset }, [copy.data.buffer]),
+      this._w.call({ image: img, formats, strategy, offset, greyEan: false, tryRotate, locate, fallback }, [image.data.buffer]),
+      this._g.call({ image: copy, formats, offset, locate, greyFallback }, [copy.data.buffer]),
     ]);
     if (z.status === 'rejected' && g.status === 'rejected') throw z.reason;
     const zr = z.status === 'fulfilled' ? z.value : [];
@@ -595,14 +595,22 @@ export class BarcodeScanner {
     // (On a phone, 12 of 41 whole-frame passes read nothing while the code sat in the box.)
     const boxBusy = performance.now() - (this._lastRoiHitAt || -1e9) < 3000;
     const roiPass = needsDownscale && (boxBusy ? pass % 8 !== 7 : pass % 4 !== 3);
-    const strategy = (roiPass ? this._roiPasses++ : this._fullPasses++) % STRATEGIES.length;
+    const n = roiPass ? this._roiPasses++ : this._fullPasses++;
+    const strategy = n % STRATEGIES.length;
     if (roiPass) {
       const r = this._region(vw, vh);
-      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true, tryRotate: false };
+      // 1D codes at any angle come from the localizer (locate), so the box pass needs
+      // ZXing's rotation search only for 2D codes, on alternate passes starting with
+      // the first (Data Matrix past ~45 degrees). The whole-box 1D searches are kept as
+      // a safety net: ZXing rows 1 pass in 4, the slow greyscale angle fan 1 in 8.
+      return {
+        sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true,
+        tryRotate: n % 2 === 0, locate: true, fallback: n % 4 === 3, greyFallback: n % 8 === 7,
+      };
     }
     const scale = Math.min(1, this.options.maxDecodeSize / Math.max(vw, vh));
     // without a separate region pass (small video), the whole frame is full resolution
-    return { sx: 0, sy: 0, sw: vw, sh: vh, scale, strategy, greyEan: !needsDownscale };
+    return { sx: 0, sy: 0, sw: vw, sh: vh, scale, strategy, greyEan: !needsDownscale, locate: true };
   }
 
   async _tick() {
@@ -630,7 +638,7 @@ export class BarcodeScanner {
       const engine = this.engine;
       const frame = { canvas: this._canvas, ctx: this._ctx, width: w, height: h };
       const t0 = performance.now();
-      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan, tryRotate: plan.tryRotate });
+      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan, tryRotate: plan.tryRotate, locate: plan.locate, fallback: plan.fallback, greyFallback: plan.greyFallback });
       const dt = performance.now() - t0;
       this.stats.frames += 1;
       this.stats.decodeMs += dt;

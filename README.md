@@ -57,6 +57,7 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 |---|---|
 | `scanner.js` | Camera, frame loop, engine selection, confirmation, camera controls |
 | `engine/decode-core.js` | Strategy ladder, sharpening, contrast stretch, ghost arbitration (no DOM; also runs in Node) |
+| `engine/locate.js` | 1D-barcode localizer (structure tensor) + rectifier: finds each code and its angle, samples it level |
 | `engine/ean-grey.js` | Greyscale EAN-13 / UPC-A / EAN-8 reader: edge reader + blur-model beam-search reader |
 | `engine/worker.js` | Web Worker: ZXing (and the greyscale reader when there is no second worker) |
 | `engine/grey-worker.js` | Second Web Worker: greyscale EAN/UPC reader only, runs in parallel |
@@ -68,6 +69,8 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 
 ## Speed
 
+- **Any angle, small crops.** `engine/locate.js` finds each 1D barcode and its angle from the image gradients (≈3 ms on the box), then samples it level at full resolution. ZXing and the greyscale reader decode only that small level crop, so 1D codes read at every angle on the first frame, and the full-box ZXing call only looks for 2D codes (with its rotation search on alternate passes, for Data Matrix past ~45°). Angle benchmark (EAN-13, Code 128, QR, Data Matrix, 0–345° in 15° steps): reads on the first box pass at every angle where the code fits in the box; before, EAN-13/Code 128/Data Matrix in the box read only within ~15°/0°/45° of level. Blurred EAN-13 reads in ~35 ms instead of ~107 ms.
+- **The slow full searches are a safety net only.** The whole-box 1D search runs 1 box pass in 4, the greyscale reader's angle fan 1 in 8. That fan cost ~180 ms per frame on textured backgrounds and used to run every box pass, holding the scanner to ~5 frames/s while aiming.
 - **Two workers in parallel** on multi-core devices: ZXing in `engine/worker.js`, the greyscale EAN/UPC reader in `engine/grey-worker.js`. A full-resolution frame costs the slower of the two, not their sum.
 - **1D codes are voted across frames.** EAN check digits pass for 1 wrong code in 10, so every 1D read is a vote kept for 2 s. A value needs 2 votes (3 if only the greyscale reader sees it). If a different 1D value was also seen, it needs at least twice the votes of every rival. Only a ZXing read backed by ≥ 12 scan lines, with no rival, is reported at once. (Added after a phone reported `9277146613147` for `6211136613147`, which had briefly been allowed through on a single frame.)
 - **A built-in detector that never reads is retired.** If `BarcodeDetector` has found nothing after 30 frames while ZXing has read at least 3, it is no longer called.
