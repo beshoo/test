@@ -43,7 +43,8 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
-import { decodeEanGrey } from './ean-grey.js?v=c6f5898-202611080111';
+import { decodeEanGrey } from './ean-grey.js?v=f73d8bf-202611081555';
+import { locateLinear, rectify } from './locate.js?v=f73d8bf-202611081555';
 
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',
@@ -148,9 +149,12 @@ function copyImage(img) {
   return { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height };
 }
 
-function normalize(r, offset) {
+/** @param {(x: number, y: number) => {x: number, y: number}} [map] rectified-crop point -> image point */
+function normalize(r, offset, map) {
   const p = r.position;
-  const pts = [p.topLeft, p.topRight, p.bottomRight, p.bottomLeft].map((q) => ({ x: q.x + offset.x, y: q.y + offset.y }));
+  const pts = [p.topLeft, p.topRight, p.bottomRight, p.bottomLeft]
+    .map((q) => (map ? map(q.x, q.y) : q))
+    .map((q) => ({ x: q.x + offset.x, y: q.y + offset.y }));
   const xs = pts.map((q) => q.x), ys = pts.map((q) => q.y);
   const x = Math.min(...xs), y = Math.min(...ys);
   return {
@@ -197,25 +201,72 @@ export function arbitrate(results) {
  * @param {(img: {data,width,height}, opts: object) => Promise<any[]>} readBarcodes zxing-wasm reader
  */
 export function createDecoder(readBarcodes) {
+  const prepare = (s, img) => (s.prep === 'stretch' ? contrastStretch(copyImage(img)) : s.prep === 'sharpen' ? sharpen(copyImage(img)) : img);
+
+  /**
+   * 1D codes at any angle: locate each code, sample it level at full resolution,
+   * and decode the small level crop (no rotation search needed, and few pixels).
+   */
+  async function decodeLocated(candidates, img, s, zxFormats, offset) {
+    const found = [];
+    for (const c of candidates) {
+      const { image, map } = rectify(img, c);
+      const res = await readBarcodes(prepare(s, image), { ...BASE, ...s.options, formats: zxFormats, tryRotate: false, tryDownscale: false });
+      for (const r of res) if (r.isValid) found.push({ ...normalize(r, offset, map), strategy: `${s.name}+located` });
+      if (found.length) break; // live scanning: the strongest candidate that reads is enough
+    }
+    return found;
+  }
+
+  /** Greyscale EAN/UPC reader on the located crops (level, so it needs no angle search). */
+  function greyLocated(candidates, img, formats) {
+    for (const c of candidates) {
+      const { image, map } = rectify(img, c, { maxThick: 160 });
+      const g = decodeEanGrey(image, formats, { angle: 0 });
+      if (g.length) return g.map((r) => ({ ...r, cornerPoints: r.cornerPoints.map((q) => map(q.x, q.y)) }));
+    }
+    return [];
+  }
+
   /**
    * Decode one image with one strategy.
    * @param {{data: Uint8ClampedArray, width: number, height: number}} img RGBA pixels
-   * @param {{formats?: string[], strategy?: number, offset?: {x:number,y:number}}} [opts]
+   * @param {object} [opts]
+   * @param {boolean} [opts.locate] live passes: 1D codes are read through the localizer
+   *        (any angle, small crops), so the full-image ZXing call only looks for 2D codes.
+   * @param {boolean} [opts.fallback=true] with `locate`, when no located crop reads, also
+   *        search the whole image for 1D codes the old way (ZXing rows).
+   * @param {boolean} [opts.greyFallback=fallback] the same for the greyscale reader's angle
+   *        fan, which is the slow part (~180 ms on a textured frame without a code).
    */
-  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true, tryRotate } = {}) {
+  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true, tryRotate, locate = false, fallback = true, greyFallback = fallback } = {}) {
     const s = STRATEGIES[strategy % STRATEGIES.length];
-    const zxFormats = formats.map((f) => FORMAT_TO_ZXING[f]).filter(Boolean);
-    let input = img;
-    if (s.prep === 'stretch') input = contrastStretch(copyImage(img));
-    else if (s.prep === 'sharpen') input = sharpen(copyImage(img));
-    const zopts = { ...BASE, ...s.options, formats: zxFormats };
-    if (tryRotate === false) zopts.tryRotate = false; // the caller knows a rotation search is not needed this pass
-    const results = zxing ? await readBarcodes(input, zopts) : [];
-    const found = arbitrate(results.filter((r) => r.isValid).map((r) => ({ ...normalize(r, offset), strategy: s.name })));
+    const wanted = formats.length ? formats : Object.keys(FORMAT_TO_ZXING);
+    const linear = wanted.filter((f) => LINEAR_FORMATS.has(f)).map((f) => FORMAT_TO_ZXING[f]);
+    const zxFormats = wanted.map((f) => FORMAT_TO_ZXING[f]).filter(Boolean);
+    const matrix = zxFormats.filter((f) => !linear.includes(f));
+    const candidates = locate && linear.length ? locateLinear(img) : [];
+    let results = [];
+    if (zxing) {
+      let rest = zxFormats;
+      if (locate && linear.length) {
+        results = await decodeLocated(candidates, img, s, linear, offset);
+        if (results.length || !fallback) rest = matrix;
+      }
+      if (rest.length) {
+        const zopts = { ...BASE, ...s.options, formats: rest };
+        if (tryRotate === false) zopts.tryRotate = false; // the caller knows a rotation search is not needed this pass
+        const full = await readBarcodes(prepare(s, img), zopts);
+        results.push(...full.filter((r) => r.isValid).map((r) => ({ ...normalize(r, offset), strategy: s.name })));
+      }
+    }
+    const found = arbitrate(results);
     // ZXing binarizes first, which loses thin bars on soft images. If it found no
     // retail code, try the greyscale EAN/UPC reader (edge + blur-model decoding).
     if (greyEan && !found.some((r) => RETAIL.has(r.format)) && formatsAllowRetail(formats)) {
-      for (const g of decodeEanGrey(img, formats)) {
+      let grey = locate ? greyLocated(candidates, img, formats) : [];
+      if (!grey.length && (!locate || greyFallback)) grey = decodeEanGrey(img, formats);
+      for (const g of grey) {
         const pts = g.cornerPoints.map((q) => ({ x: q.x + offset.x, y: q.y + offset.y }));
         const xs = pts.map((q) => q.x), ys = pts.map((q) => q.y);
         found.push({
@@ -238,7 +289,7 @@ export function createDecoder(readBarcodes) {
   /** Try every strategy until one finds something (for still images). */
   async function decodeAll(img, opts = {}) {
     for (let i = 0; i < STRATEGIES.length; i += 1) {
-      const found = await decodeOnce(img, { ...opts, strategy: i, greyEan: false });
+      const found = await decodeOnce(img, { ...opts, strategy: i, greyEan: false, locate: true });
       if (found.length) return found;
     }
     // the greyscale reader does not depend on the ZXing strategy: run it once

@@ -13,6 +13,7 @@ stamp scanner.js engine/decode-core.js
 stamp scanner.js engine/worker.js
 stamp engine/worker.js decode-core.js
 stamp engine/decode-core.js ean-grey.js
+stamp engine/decode-core.js locate.js
 stamp scanner.js engine/grey-worker.js
 stamp engine/grey-worker.js decode-core.js
 stamp engine/grey-worker.js ean-grey.js

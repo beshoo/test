@@ -81,6 +81,24 @@ Wrong values: 0 here, 0 in a further 600-case stress suite, and 0 on the 216-fra
 
 **Camera:** the scanner now probes the back cameras for one with continuous autofocus, and warns when the chosen camera has none.
 
+## 2c. Any-angle 1D reading: localize, then rectify (2026-11-08)
+
+**Problem:** in the box pass (3 of 4 passes) ZXing ran with `tryRotate` off, and even with it on, ZXing scans only rows and columns. A 1D code tilted past roughly atan(height/width) is crossed by no row from end to end: about 25° for an EAN-13, under 10° for a long Code 128. Data Matrix also needed `tryRotate` past ~45°. The greyscale reader did search angles, but with an 18-angle fan over the whole box: 40–180 ms per frame.
+
+**Method** (published, generic: gradient structure tensor; Tekin & Coughlan 2012, Katona & Nyúl 2012): half-resolution luminance → per 16×16-px cell, structure tensor of the gradients → cells with high energy *and* high coherence (bars all point one way; text does not) → join neighbouring cells of similar orientation → each group gives centre, scan direction and extent → sample it level at full resolution (bilinear) with a quiet-zone margin. ZXing (`tryRotate` off) and the greyscale reader (angle 0) decode only that crop. `engine/locate.js`, ~3 ms per 1459×691 box on a desktop CPU.
+
+**Results** (192 box-sized frames: 4 codes × 24 angles × clean/soft, plus 24 blurred EAN-13; one live box pass, both workers):
+
+| | Before | After |
+|---|---|---|
+| EAN-13, any angle | 72/72 (only via the greyscale reader, 40–107 ms) | 72/72, 17–36 ms |
+| Code 128, any angle (code fits in box) | 4/38 | 38/38 |
+| Data Matrix, any angle | 13/48 | 48/48 on the first pass |
+| QR | 48/48 | 48/48 |
+| Code-free textured frame, greyscale worker | ~180 ms every box pass | 6.5 ms (full fan 1 pass in 8) |
+| Original 216-frame benchmark | | no condition worse; Code 128 noise 5→6/6, glare 4→6/6; noisy frames 2–3× faster |
+| Wrong values | 0 | 0 |
+
 ## 3. The honest gap
 
 Heavy defocus and motion blur stay at **0%**. That is the core of Scandit's advantage (#1) and can't be fixed by preprocessing before ZXing, because ZXing's first step (black-and-white conversion) destroys the information. Options, in order of value:

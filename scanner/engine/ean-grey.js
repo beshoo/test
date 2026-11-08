@@ -627,11 +627,12 @@ function barcodeOutline(spans, lum, w, h) {
 /**
  * @param {{data: Uint8ClampedArray, width: number, height: number}} img RGBA
  * @param {string[]} formats requested formats ([] = all)
+ * @param {{angle?: number}} [hint] scan angle in degrees where the localizer found a code
  * @returns {{rawValue: string, format: string, lines: number, cornerPoints: {x,y}[]}[]}
  */
 let lastAngle = 0; // scan angle of the last successful read (per worker)
 
-export function decodeEanGrey(img, formats = []) {
+export function decodeEanGrey(img, formats = [], { angle: hintAngle } = {}) {
   const want = (f) => !formats.length || formats.includes(f);
   const wantEan13 = want('ean_13') || want('upc_a');
   const wantEan8 = want('ean_8');
@@ -682,12 +683,14 @@ export function decodeEanGrey(img, formats = []) {
     }
   };
 
-  // Start at the angle that worked last time (or horizontal) and fan out from it;
-  // stop once one value has 4 agreeing lines and nothing competes with it.
+  // Start at the localizer's angle, else the angle that worked last time (or
+  // horizontal), and fan out from it; stop once one value has 4 agreeing lines
+  // and nothing competes with it.
+  const start = hintAngle != null ? Math.round(hintAngle) : lastAngle;
   const angles = [];
   for (let k = 0; k < 18; k += 1) {
     const step = Math.ceil(k / 2) * 10 * (k % 2 ? 1 : -1);
-    angles.push(((lastAngle + step) % 180 + 180) % 180);
+    angles.push(((start + step) % 180 + 180) % 180);
   }
   const settled = () => {
     const counts = [...votes.values()].map((v) => v.count).sort((x, y) => y - x);
