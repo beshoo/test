@@ -43,7 +43,7 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
-import { decodeEanGrey } from './ean-grey.js?v=1ad4166-202611080027';
+import { decodeEanGrey } from './ean-grey.js?v=9b5d238-202611080034';
 
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',

@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=1ad4166-202611080027';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=9b5d238-202611080034';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -30,37 +30,54 @@ export const COMMON_FORMATS = [
 // Engines
 // ---------------------------------------------------------------------------
 
-let sharedWorker = null;
+/** A module worker with promise-based calls. */
+function makeWorker(url) {
+  const worker = new Worker(url, { type: 'module' });
+  const pending = new Map();
+  let nextId = 1;
+  worker.onmessage = ({ data }) => {
+    const p = pending.get(data.id);
+    if (!p) return;
+    pending.delete(data.id);
+    if (data.error) p.reject(new Error(data.error));
+    else p.resolve(data.results);
+  };
+  worker.onerror = (e) => {
+    const err = new Error(`Decoder worker failed: ${e.message || 'unknown error'}`);
+    pending.forEach((p) => p.reject(err));
+    pending.clear();
+  };
+  const call = (msg, transfer = []) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ ...msg, id }, transfer);
+  });
+  return { worker, call, ready: call({ type: 'ping' }) };
+}
 
-/** ZXing in a module Web Worker. One worker is shared by all scanners on the page. */
+let zxingWorker = null;
+let greyWorker = null;
+const RETAIL = new Set(['ean_13', 'ean_8', 'upc_a', 'upc_e']);
+
+/**
+ * ZXing in a module Web Worker, plus (on multi-core devices) a second worker that
+ * runs the greyscale EAN/UPC reader at the same time, so a full-resolution frame
+ * costs max(ZXing, greyscale) instead of their sum. Shared by all scanners on the page.
+ */
 class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
-    if (!sharedWorker) {
-      const worker = new Worker(new URL('./engine/worker.js?v=1ad4166-202611080027', import.meta.url), { type: 'module' });
-      const pending = new Map();
-      let nextId = 1;
-      worker.onmessage = ({ data }) => {
-        const p = pending.get(data.id);
-        if (!p) return;
-        pending.delete(data.id);
-        if (data.error) p.reject(new Error(data.error));
-        else p.resolve(data.results);
-      };
-      worker.onerror = (e) => {
-        const err = new Error(`Decoder worker failed: ${e.message || 'unknown error'}`);
-        pending.forEach((p) => p.reject(err));
-        pending.clear();
-      };
-      const call = (msg, transfer = []) => new Promise((resolve, reject) => {
-        const id = nextId++;
-        pending.set(id, { resolve, reject });
-        worker.postMessage({ ...msg, id }, transfer);
-      });
-      sharedWorker = { worker, call, ready: call({ type: 'ping' }) };
-      sharedWorker.ready.catch(() => { sharedWorker = null; });
+    if (!zxingWorker) {
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=9b5d238-202611080034', import.meta.url));
+      zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
-    this._w = sharedWorker;
+    if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=9b5d238-202611080034', import.meta.url));
+      greyWorker.ready.catch(() => { greyWorker = null; });
+    }
+    this._w = zxingWorker;
+    this._g = greyWorker;
+    this.parallel = Boolean(greyWorker);
   }
 
   ready() {
@@ -68,9 +85,23 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  decodeImage(image, { formats, strategy, offset, all = false, greyEan = true }) {
+  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true }) {
     const img = { data: image.data, width: image.width, height: image.height };
-    return this._w.call({ image: img, formats, strategy, offset, all, greyEan }, [image.data.buffer]);
+    if (!greyEan || all || !this._g) {
+      return this._w.call({ image: img, formats, strategy, offset, all, greyEan }, [image.data.buffer]);
+    }
+    // Parallel: ZXing in one worker, the greyscale reader in the other (on a copy).
+    const copy = { data: new Uint8ClampedArray(image.data), width: image.width, height: image.height };
+    const [z, g] = await Promise.allSettled([
+      this._w.call({ image: img, formats, strategy, offset, greyEan: false }, [image.data.buffer]),
+      this._g.call({ image: copy, formats, offset }, [copy.data.buffer]),
+    ]);
+    if (z.status === 'rejected' && g.status === 'rejected') throw z.reason;
+    const zr = z.status === 'fulfilled' ? z.value : [];
+    const gr = g.status === 'fulfilled' ? g.value : [];
+    // Same rule as the sequential path: greyscale results only when ZXing found no retail code.
+    if (zr.some((r) => RETAIL.has(r.format))) return zr;
+    return [...zr, ...gr.filter((r) => !zr.some((o) => o.rawValue === r.rawValue))];
   }
 
   /** @param {{canvas, ctx, width, height}} frame */
@@ -120,6 +151,8 @@ class HybridEngine {
     this.zxing = zxing;
     this.hits = { native: 0, zxing: 0 };
     this.errors = { native: null, zxing: null };
+    this.attempts = 0;
+    this.nativeOff = false; // set when the built-in detector never reads but ZXing does
   }
 
   ready() {
@@ -127,6 +160,15 @@ class HybridEngine {
   }
 
   async decode(frame, opts) {
+    this.attempts += 1;
+    // Some devices expose BarcodeDetector but it never finds anything. Every frame
+    // would still wait for it, so stop using it once ZXing has clearly taken over.
+    if (!this.nativeOff && this.attempts >= 30 && this.hits.native === 0 && this.hits.zxing >= 3) this.nativeOff = true;
+    if (this.nativeOff) {
+      const zr = await this.zxing.decode(frame, opts);
+      if (zr.length) this.hits.zxing += 1;
+      return zr;
+    }
     // Copy pixels for ZXing first: the canvas is not redrawn until both finish.
     const image = frame.ctx.getImageData(0, 0, frame.width, frame.height);
     const [n, z] = await Promise.allSettled([this.native.decode(frame, opts), this.zxing.decodeImage(image, opts)]);
@@ -279,6 +321,11 @@ export class BarcodeScanner {
     this._running = false;
     this._busy = false;
     this._pass = 0;
+    this._roiPasses = 0;
+    this._fullPasses = 0;
+    this._lastRoiHitAt = 0;
+    this.firstReadMs = null;
+    this._startedAt = 0;
     this._lastScanAt = 0;
     this._seen = new Map();    // rawValue -> last reported time
     this._pending = new Map(); // rawValue -> {count, t} awaiting confirmation
@@ -359,6 +406,8 @@ export class BarcodeScanner {
     this.video.srcObject = this.stream;
     await this.video.play();
     this._running = true;
+    this._startedAt = performance.now();
+    this.firstReadMs = null;
     this._seen.clear();
     this._pending.clear();
     this._schedule();
@@ -400,6 +449,9 @@ export class BarcodeScanner {
     return {
       engine: this.engine?.name ?? null,
       engineHits: this.engine?.hits ?? null,
+      nativeRetired: this.engine?.nativeOff ?? null,
+      parallelWorkers: (this.engine?.zxing ?? this.engine)?.parallel ?? null,
+      firstReadMs: this.firstReadMs,
       engineErrors: this.engine?.errors ?? null,
       camera: t?.label ?? null,
       resolution: st.width ? `${st.width}x${st.height} @ ${Math.round(st.frameRate || 0)}fps` : null,
@@ -501,8 +553,11 @@ export class BarcodeScanner {
   _plan(vw, vh) {
     const pass = this._pass++;
     const needsDownscale = Math.max(vw, vh) > this.options.maxDecodeSize;
-    const roiPass = needsDownscale && pass % 2 === 0;
-    const strategy = Math.floor(pass / (needsDownscale ? 2 : 1)) % STRATEGIES.length;
+    // Alternate box / whole frame; while codes keep turning up in the box, give it
+    // three passes out of four.
+    const boxBusy = performance.now() - (this._lastRoiHitAt || -1e9) < 3000;
+    const roiPass = needsDownscale && (boxBusy ? pass % 4 !== 3 : pass % 2 === 0);
+    const strategy = (roiPass ? this._roiPasses++ : this._fullPasses++) % STRATEGIES.length;
     if (roiPass) {
       const r = this._region(vw, vh);
       return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true };
@@ -558,12 +613,14 @@ export class BarcodeScanner {
       if (results.length) {
         this.lastResults = results;
         this._lastHitAt = tNow;
+        if (plan.scale === 1 && plan.greyEan) this._lastRoiHitAt = tNow;
       } else if (!this._lastHitAt || tNow - this._lastHitAt > 300) {
         this.lastResults = [];
       }
 
       const fresh = this._accept(results, tNow);
       if (fresh.length) {
+        if (this.firstReadMs === null) this.firstReadMs = Math.round(tNow - this._startedAt);
         this.options.onDetect(fresh);
         if (!this.options.continuous) this.stop();
       }
@@ -580,7 +637,10 @@ export class BarcodeScanner {
     const out = [];
     for (const [value, p] of this._pending) if (now - p.t > 1500) this._pending.delete(value);
     for (const r of results) {
-      const needed = LINEAR_FORMATS.has(r.format) ? this.options.confirmLinear : 1;
+      // Retail codes with a strong read skip the second frame: their check digit
+      // passed, and many scan lines agreed (ghost reads had 5 ZXing lines, real 49).
+      const strong = RETAIL.has(r.format) && (r.strategy === 'greyscale-ean' ? (r.lineCount || 0) >= 3 : (r.lineCount || 0) >= 12);
+      const needed = LINEAR_FORMATS.has(r.format) && !strong ? this.options.confirmLinear : 1;
       if (needed > 1) {
         const p = this._pending.get(r.rawValue) ?? { count: 0, t: now };
         p.count += 1;

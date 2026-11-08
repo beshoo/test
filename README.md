@@ -58,12 +58,22 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 | `scanner.js` | Camera, frame loop, engine selection, confirmation, camera controls |
 | `engine/decode-core.js` | Strategy ladder, sharpening, contrast stretch, ghost arbitration (no DOM; also runs in Node) |
 | `engine/ean-grey.js` | Greyscale EAN-13 / UPC-A / EAN-8 reader: edge reader + blur-model beam-search reader |
-| `engine/worker.js` | Web Worker wrapper around the decoder |
+| `engine/worker.js` | Web Worker: ZXing (and the greyscale reader when there is no second worker) |
+| `engine/grey-worker.js` | Second Web Worker: greyscale EAN/UPC reader only, runs in parallel |
 | `gs1.js` | GS1 element-string parser |
 | `index.html` | Demo UI |
 | `vendor/zxing-wasm/` | Vendored zxing-wasm 3.1.3 reader (+ `.wasm`, SHA-256 `2ebda08a…c6d1ba`), MIT |
 | `bench/` | Benchmark: `make-codes.mjs` → `make-frames.py` → `bench.mjs` |
 | `stamp-version.sh` | Adds `?v=` cache-busting versions to the module URLs. Run it after every change |
+
+## Speed
+
+- **Two workers in parallel** on multi-core devices: ZXing in `engine/worker.js`, the greyscale EAN/UPC reader in `engine/grey-worker.js`. A full-resolution frame costs the slower of the two, not their sum.
+- **Strong retail reads are reported at once.** An EAN/UPC whose check digit passed and that many scan lines agree on (≥ 3 greyscale lines, or ≥ 12 ZXing lines) skips the second confirming frame.
+- **A built-in detector that never reads is retired.** If `BarcodeDetector` has found nothing after 30 frames while ZXing has read at least 3, it is no longer called.
+- **The box gets priority.** While codes keep turning up in the target box, it is decoded 3 frames out of 4 at full resolution.
+- **Templates are built at start-up** (`warmUp()`, in the worker), not on the first frames.
+- `diagnostics()` reports `firstReadMs`, `parallelWorkers` and `nativeRetired`.
 
 ## Camera choice
 
