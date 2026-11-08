@@ -2,11 +2,11 @@
  * Decoding Web Worker: runs ZXing-WASM off the main thread so the camera
  * preview and UI stay smooth while frames are being decoded.
  *
- * Messages in:  { id, image: {data, width, height}, formats, strategy, offset, all, tryRotate, locate, fallback, greyFallback }
+ * Messages in:  { id, image: {data, width, height}, formats, strategy, offset, all, tryRotate, locate, fallback, greyFallback, deblur }
  * Messages out: { id, results } | { id, error }
  */
 import { prepareZXingModule, readBarcodes } from '../vendor/zxing-wasm/reader/index.js';
-import { createDecoder } from './decode-core.js?v=f73d8bf-202611081555';
+import { createDecoder } from './decode-core.js?v=9fccbc3-202611081635';
 
 const wasmDir = new URL('../vendor/zxing-wasm/reader/', import.meta.url);
 
@@ -31,7 +31,7 @@ self.onmessage = async ({ data: msg }) => {
   }
   try {
     await ready;
-    const opts = { formats: msg.formats, strategy: msg.strategy, offset: msg.offset, greyEan: msg.greyEan !== false, zxing: msg.zxing !== false, tryRotate: msg.tryRotate, locate: msg.locate, fallback: msg.fallback !== false, greyFallback: msg.greyFallback ?? msg.fallback !== false };
+    const opts = { formats: msg.formats, strategy: msg.strategy, offset: msg.offset, greyEan: msg.greyEan !== false, zxing: msg.zxing !== false, tryRotate: msg.tryRotate, locate: msg.locate, fallback: msg.fallback !== false, greyFallback: msg.greyFallback ?? msg.fallback !== false, deblur: msg.deblur };
     const results = msg.all ? await decoder.decodeAll(msg.image, opts) : await decoder.decodeOnce(msg.image, opts);
     self.postMessage({ id: msg.id, results });
   } catch (err) {

@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Scanner Replay</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5f6b7a;
+      --line: #dde2e8; --accent: #0b6bcb; --accent-text: #ffffff; --ok: #1a7f37; --warn: #b35900;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #9aa5b1;
+        --line: #2a313a; --accent: #4c9dff; --accent-text: #0b0e12; --ok: #4ade80; --warn: #fbbf24;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 900px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .version { font-size: 12px; font-weight: 500; color: var(--muted); border: 1px solid var(--line);
+      border-radius: 999px; padding: 1px 8px; vertical-align: middle; white-space: nowrap; }
+    .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+    video { width: 100%; max-height: 50vh; background: #000; border-radius: 12px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
+    button, select, input[type=text], label.file {
+      font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+      border-radius: 8px; padding: 8px 12px; min-height: 40px;
+    }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    label.file { cursor: pointer; }
+    label.file input { display: none; }
+    input[type=text] { flex: 1 1 220px; min-width: 0; }
+    #status { color: var(--muted); font-size: 14px; min-height: 1.4em; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    td.vals { white-space: normal; word-break: break-all; font-family: ui-monospace, Consolas, monospace; }
+    .ok { color: var(--ok); } .bad { color: var(--warn); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Scanner replay <span class="version" id="version"></span></h1>
+  <p class="sub">Record short clips with the phone's camera app (start with the code out of view or out of focus, then aim at it), then replay them here. "Real time" plays at normal speed on this device, like live scanning. "Every frame" decodes 15 frames per video second, whatever this device's speed, to measure what is readable.</p>
+
+  <video id="video" muted playsinline></video>
+
+  <div class="controls">
+    <label class="file">Choose videos… <input id="files" type="file" accept="video/*" multiple></label>
+    <select id="mode">
+      <option value="live">Real time</option>
+      <option value="step">Every frame</option>
+    </select>
+    <select id="engine">
+      <option value="auto">Auto engine</option>
+      <option value="zxing">ZXing only</option>
+    </select>
+    <input id="expected" type="text" placeholder="Expected value (optional, to count wrong reads)">
+    <button id="run" class="primary" disabled>Run</button>
+    <button id="copy" disabled>Copy results</button>
+  </div>
+  <p id="status">Choose one or more videos.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Clip</th><th>Mode</th><th>Length</th><th>First read</th><th>Decodes</th><th>ms each</th><th>Frames read</th><th>Wrong</th><th>Values</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+
+<script type="module">
+  import { BarcodeScanner, VERSION } from './scanner.js?v=9fccbc3-202611081635';
+
+  const $ = (id) => document.getElementById(id);
+  $('version').textContent = `Version ${VERSION.label}`;
+  $('version').title = VERSION.stamp;
+  const video = $('video');
+  const FORMATS = ['qr_code', 'data_matrix', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'];
+  const STEP = 1 / 15;
+  let clips = [];
+  const results = [];
+
+  // Automated runs: ?videos=a.mp4,b.mp4 or ?manifest=bench/clips/manifest.json
+  // (entries {clip, expected, appearsAt}, from bench/make-clips.py), plus &run=live|step.
+  const query = new URLSearchParams(location.search);
+  if (query.get('videos')) clips = query.get('videos').split(',').map((u) => ({ name: u.split('/').pop(), url: u }));
+  if (query.get('manifest')) {
+    const m = new URL(query.get('manifest'), location.href);
+    clips = (await (await fetch(m)).json()).map((c) => ({ ...c, name: c.clip, url: new URL(c.clip, m).href }));
+  }
+  syncButtons();
+
+  $('files').onchange = () => {
+    clips = [...$('files').files].map((f) => ({ name: f.name, url: URL.createObjectURL(f) }));
+    syncButtons();
+  };
+  $('run').onclick = runAll;
+  $('copy').onclick = () => navigator.clipboard.writeText(JSON.stringify({ version: VERSION.stamp, userAgent: navigator.userAgent, results }, null, 2));
+
+  function syncButtons() {
+    $('run').disabled = !clips.length;
+    $('copy').disabled = !results.length;
+    if (clips.length) $('status').textContent = `${clips.length} clip(s) ready.`;
+  }
+
+  const once = (el, ev) => new Promise((resolve, reject) => {
+    el.addEventListener(ev, resolve, { once: true });
+    el.addEventListener('error', () => reject(new Error(`cannot play ${video.currentSrc}`)), { once: true });
+  });
+
+  async function runClip(clip, mode, engine, expected) {
+    video.src = clip.url;
+    await once(video, 'loadeddata');
+    if (!Number.isFinite(video.duration)) {
+      // browser-recorded WebM has no duration in its header: seeking to the end reveals it
+      video.currentTime = 1e9;
+      await once(video, 'seeked');
+    }
+    const reads = [];
+    const scanner = new BarcodeScanner(video, {
+      formats: FORMATS,
+      engine,
+      onDetect: (codes) => codes.forEach((c) => reads.push({ t: video.currentTime, value: c.rawValue, format: c.format })),
+      onError: (err) => console.warn(err),
+    });
+    if (mode === 'live') {
+      video.currentTime = 0;
+      await scanner.startOnVideo();
+      const ended = once(video, 'ended');
+      await video.play();
+      await ended;
+    } else {
+      await scanner.startOnVideo({ loop: false });
+      for (let t = 0; t < video.duration; t += STEP) {
+        video.currentTime = t;
+        await once(video, 'seeked');
+        await scanner.scanFrame();
+        $('status').textContent = `${clip.name}: ${t.toFixed(1)} / ${video.duration.toFixed(1)} s`;
+      }
+    }
+    const d = scanner.diagnostics();
+    const lengthS = +video.duration.toFixed(2);
+    scanner.stop();
+    const values = [...new Set(reads.map((r) => r.value))];
+    return {
+      clip: clip.name,
+      mode,
+      engine: d.engine,
+      lengthS,
+      video: d.video,
+      // seconds from the code coming into view (if known) to the first reported read
+      firstReadS: reads.length ? +(reads[0].t - (clip.appearsAt ?? 0)).toFixed(2) : null,
+      decodes: d.attempts,
+      avgDecodeMs: d.avgDecodeMs,
+      framesRead: d.reads,
+      wrong: expected ? values.filter((v) => !v.includes(expected)).length : null,
+      values,
+      passes: d.passes,
+    };
+  }
+
+  async function runAll() {
+    $('run').disabled = true;
+    const mode = $('mode').value, engine = $('engine').value, expected = $('expected').value.trim();
+    for (const clip of clips) {
+      $('status').textContent = `Running ${clip.name}…`;
+      try {
+        const r = await runClip(clip, mode, engine, clip.expected ?? expected);
+        results.push(r);
+        addRow(r);
+      } catch (err) {
+        addRow({ clip: clip.name, mode, error: String(err.message || err) });
+      }
+    }
+    syncButtons();
+    $('status').textContent = `Done: ${clips.length} clip(s). "Copy results" copies everything as JSON.`;
+    window.replayResults = results; // for automated runs
+  }
+
+  function addRow(r) {
+    const tr = document.createElement('tr');
+    const cells = r.error
+      ? [r.clip, r.mode, r.error, '', '', '', '', '', '']
+      : [r.clip, r.mode, `${r.lengthS} s`, r.firstReadS === null ? 'never' : `${r.firstReadS} s`, r.decodes, r.avgDecodeMs,
+        `${r.framesRead}/${r.decodes}`, r.wrong ?? '–', r.values.join(', ')];
+    cells.forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = v;
+      if (i === 3) td.className = r.firstReadS === null || r.error ? 'bad' : 'ok';
+      if (i === 7 && r.wrong) td.className = 'bad';
+      if (i === 8) td.className = 'vals';
+      tr.append(td);
+    });
+    $('rows').append(tr);
+  }
+
+  if (query.get('run') && clips.length) {
+    $('mode').value = query.get('run');
+    runAll();
+  }
+</script>
+</body>
+</html>

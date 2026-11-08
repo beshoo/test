@@ -60,18 +60,21 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 | `engine/locate.js` | 1D-barcode localizer (structure tensor) + rectifier: finds each code and its angle, samples it level |
 | `engine/ean-grey.js` | Greyscale EAN-13 / UPC-A / EAN-8 reader: edge reader + blur-model beam-search reader |
 | `engine/worker.js` | Web Worker: ZXing (and the greyscale reader when there is no second worker) |
-| `engine/grey-worker.js` | Second Web Worker: greyscale EAN/UPC reader only, runs in parallel |
+| `engine/deblur.js` | Motion-blur / defocus restoration of located 1D codes: line-averaged profile + Wiener deconvolution per blur hypothesis |
+| `engine/grey-worker.js` | Second Web Worker, in parallel with ZXing: greyscale EAN/UPC reader and deblurring (own ZXing instance for the restored profiles) |
 | `gs1.js` | GS1 element-string parser |
 | `index.html` | Demo UI |
+| `replay.html` | Replays recorded videos through the scanner (real time, or every frame) and reports time to first read, frames read and wrong values; for comparing real-phone recordings |
 | `vendor/zxing-wasm/` | Vendored zxing-wasm 3.1.3 reader (+ `.wasm`, SHA-256 `2ebda08a…c6d1ba`), MIT |
-| `bench/` | Benchmark: `make-codes.mjs` → `make-frames.py` → `bench.mjs` |
+| `bench/` | Benchmarks: `make-codes.mjs` → `make-frames.py` → `bench.mjs` (still frames); `make-clips.py` → `clip-bench.mjs` (motion, shake, focus-pull clips, scored like live scanning) |
 | `stamp-version.sh` | Adds `?v=` cache-busting versions to the module URLs. Run it after every change |
 
 ## Speed
 
 - **Any angle, small crops.** `engine/locate.js` finds each 1D barcode and its angle from the image gradients (≈3 ms on the box), then samples it level at full resolution. ZXing and the greyscale reader decode only that small level crop, so 1D codes read at every angle on the first frame, and the full-box ZXing call only looks for 2D codes (with its rotation search on alternate passes, for Data Matrix past ~45°). Angle benchmark (EAN-13, Code 128, QR, Data Matrix, 0–345° in 15° steps): reads on the first box pass at every angle where the code fits in the box; before, EAN-13/Code 128/Data Matrix in the box read only within ~15°/0°/45° of level. Blurred EAN-13 reads in ~35 ms instead of ~107 ms.
 - **The slow full searches are a safety net only.** The whole-box 1D search runs 1 box pass in 4, the greyscale reader's angle fan 1 in 8. That fan cost ~180 ms per frame on textured backgrounds and used to run every box pass, holding the scanner to ~5 frames/s while aiming.
-- **Two workers in parallel** on multi-core devices: ZXing in `engine/worker.js`, the greyscale EAN/UPC reader in `engine/grey-worker.js`. A full-resolution frame costs the slower of the two, not their sum.
+- **Two workers in parallel** on multi-core devices: ZXing in `engine/worker.js`; the greyscale EAN/UPC reader and deblurring in `engine/grey-worker.js`. A full-resolution frame costs the slower of the two, not their sum.
+- **Deblurring only where it can help.** `engine/deblur.js` runs only on located 1D codes whose edges are soft (steepness 0.08–0.36: sharp codes are ZXing's, and nothing softer was recoverable), so it adds no time to sharp frames. Its reads need 3 frames to confirm, like the greyscale reader's.
 - **1D codes are voted across frames.** EAN check digits pass for 1 wrong code in 10, so every 1D read is a vote kept for 2 s. A value needs 2 votes (3 if only the greyscale reader sees it). If a different 1D value was also seen, it needs at least twice the votes of every rival. Only a ZXing read backed by ≥ 12 scan lines, with no rival, is reported at once. (Added after a phone reported `9277146613147` for `6211136613147`, which had briefly been allowed through on a single frame.)
 - **A built-in detector that never reads is retired.** If `BarcodeDetector` has found nothing after 30 frames while ZXing has read at least 3, it is no longer called.
 - **The box gets priority.** While codes keep turning up in the target box, it is decoded 3 frames out of 4 at full resolution.
@@ -85,4 +88,5 @@ On multi-camera phones, `facingMode: "environment"` often opens an ultra-wide or
 
 ## Known limits
 
-Heavy defocus and motion blur are not readable (0% in the benchmark). ZXing converts to black-and-white before decoding, which destroys that information. See §3 of the research doc for the options.
+- **1D codes:** motion blur up to ~2–4 modules and defocus up to ~1 module now read through deblurring (research doc §2d); beyond that, nothing reads.
+- **2D codes (QR, Data Matrix):** heavy defocus and motion blur still read 0%; deblurring is 1D only so far.

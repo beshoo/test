@@ -17,7 +17,17 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=f73d8bf-202611081555';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=9fccbc3-202611081635';
+
+/**
+ * Build stamp from this module's own URL (stamp-version.sh adds ?v=<commit>-<YYYYMMDDHHMM>),
+ * shown on the pages so a phone can be checked for the latest version.
+ */
+export const VERSION = (() => {
+  const v = new URL(import.meta.url).searchParams.get('v') || 'dev';
+  const m = v.match(/^(\w+)-(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)$/);
+  return m ? { label: `${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]}`, stamp: v } : { label: v, stamp: v };
+})();
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -58,6 +68,8 @@ function makeWorker(url) {
 let zxingWorker = null;
 let greyWorker = null;
 const RETAIL = new Set(['ean_13', 'ean_8', 'upc_a', 'upc_e']);
+/** Reads that come from modelling a soft image (not from ZXing on the camera pixels). */
+const MODEL_BASED = new Set(['greyscale-ean', 'deblur']);
 
 /**
  * ZXing in a module Web Worker, plus (on multi-core devices) a second worker that
@@ -68,11 +80,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=f73d8bf-202611081555', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=9fccbc3-202611081635', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=f73d8bf-202611081555', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=9fccbc3-202611081635', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -85,16 +97,16 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true, tryRotate, locate, fallback, greyFallback }) {
+  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true, tryRotate, locate, fallback, greyFallback, deblur }) {
     const img = { data: image.data, width: image.width, height: image.height };
     if (!greyEan || all || !this._g) {
-      return this._w.call({ image: img, formats, strategy, offset, all, greyEan, tryRotate, locate, fallback, greyFallback }, [image.data.buffer]);
+      return this._w.call({ image: img, formats, strategy, offset, all, greyEan, tryRotate, locate, fallback, greyFallback, deblur }, [image.data.buffer]);
     }
-    // Parallel: ZXing in one worker, the greyscale reader in the other (on a copy).
+    // Parallel: ZXing in one worker, the soft-frame readers (greyscale, deblur) in the other (on a copy).
     const copy = { data: new Uint8ClampedArray(image.data), width: image.width, height: image.height };
     const [z, g] = await Promise.allSettled([
       this._w.call({ image: img, formats, strategy, offset, greyEan: false, tryRotate, locate, fallback }, [image.data.buffer]),
-      this._g.call({ image: copy, formats, offset, locate, greyFallback }, [copy.data.buffer]),
+      this._g.call({ image: copy, formats, offset, strategy, locate, greyFallback, deblur }, [copy.data.buffer]),
     ]);
     if (z.status === 'rejected' && g.status === 'rejected') throw z.reason;
     const zr = z.status === 'fulfilled' ? z.value : [];
@@ -423,6 +435,32 @@ export class BarcodeScanner {
 
     this.video.srcObject = this.stream;
     await this.video.play();
+    this._begin();
+  }
+
+  /**
+   * Scan a pre-recorded video already loaded in the element (benchmarks, replay.html).
+   * The caller plays it, or steps through it with scanFrame().
+   * @param {{loop?: boolean}} [opts] loop=false: scanFrame() only, no frame loop
+   */
+  async startOnVideo({ loop = true } = {}) {
+    if (this._running) return;
+    this.engine ??= await createEngine(this.options.formats, this.options.engine);
+    this._begin(loop);
+  }
+
+  /** Decode the frame the video shows now, once (stepping through a recording). */
+  async scanFrame() {
+    if (!this._running || this._busy) return;
+    this._busy = true;
+    try {
+      await this._scan();
+    } finally {
+      this._busy = false;
+    }
+  }
+
+  _begin(loop = true) {
     this._running = true;
     this._startedAt = performance.now();
     this.firstReadMs = null;
@@ -430,7 +468,7 @@ export class BarcodeScanner {
     this.passStats = { box: { attempts: 0, reads: 0, ms: 0 }, frame: { attempts: 0, reads: 0, ms: 0 } };
     this._seen.clear();
     this._pending.clear();
-    this._schedule();
+    if (loop) this._schedule();
   }
 
   stop() {
@@ -605,7 +643,7 @@ export class BarcodeScanner {
       // a safety net: ZXing rows 1 pass in 4, the slow greyscale angle fan 1 in 8.
       return {
         sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true,
-        tryRotate: n % 2 === 0, locate: true, fallback: n % 4 === 3, greyFallback: n % 8 === 7,
+        tryRotate: n % 2 === 0, locate: true, fallback: n % 4 === 3, greyFallback: n % 8 === 7, deblur: true,
       };
     }
     const scale = Math.min(1, this.options.maxDecodeSize / Math.max(vw, vh));
@@ -624,7 +662,15 @@ export class BarcodeScanner {
     this._busy = true;
     this._lastScanAt = now;
     this._schedule();
+    try {
+      await this._scan();
+    } finally {
+      this._busy = false;
+    }
+  }
 
+  async _scan() {
+    const video = this.video;
     try {
       const vw = video.videoWidth, vh = video.videoHeight;
       const plan = this._plan(vw, vh);
@@ -638,7 +684,7 @@ export class BarcodeScanner {
       const engine = this.engine;
       const frame = { canvas: this._canvas, ctx: this._ctx, width: w, height: h };
       const t0 = performance.now();
-      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan, tryRotate: plan.tryRotate, locate: plan.locate, fallback: plan.fallback, greyFallback: plan.greyFallback });
+      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan, tryRotate: plan.tryRotate, locate: plan.locate, fallback: plan.fallback, greyFallback: plan.greyFallback, deblur: plan.deblur });
       const dt = performance.now() - t0;
       this.stats.frames += 1;
       this.stats.decodeMs += dt;
@@ -679,8 +725,6 @@ export class BarcodeScanner {
     } catch (err) {
       this.lastError = String(err?.message || err);
       this.options.onError(err);
-    } finally {
-      this._busy = false;
     }
   }
 
@@ -689,8 +733,8 @@ export class BarcodeScanner {
    * Decide which reads to report. 1D codes have weak checksums (a wrong EAN passes
    * its check digit 1 time in 10), so for them:
    *   - every read is a vote, kept for 2 s;
-   *   - a value needs `confirmLinear` (2) votes, 3 if only the greyscale reader
-   *     sees it (soft frames), or 1 for a ZXing read backed by >= 12 scan lines
+   *   - a value needs `confirmLinear` (2) votes, 3 if it comes only from modelling
+   *     a soft frame (greyscale reader, deblurring), or 1 for a ZXing read backed by >= 12 scan lines
    *     (ghost reads had 5, real ones ~49) with no rival;
    *   - if a different 1D value was also seen in the last 2 s, a value must have at
    *     least twice the votes of every rival. A rare bad frame cannot win against
@@ -712,14 +756,14 @@ export class BarcodeScanner {
         const p = this._pending.get(r.rawValue) ?? { count: 0, t: now, first: now, format: r.format };
         // A greyscale frame with strong evidence counts twice: its two methods (bar
         // edges and blur model) agree, or >= 3 scan lines from >= 2 angles agree.
-        p.count += r.strategy === 'greyscale-ean' && r.strong ? 2 : 1;
+        p.count += MODEL_BASED.has(r.strategy) && r.strong ? 2 : 1;
         p.t = now;
         this._pending.set(r.rawValue, p);
         let rival = 0;
         for (const [value, q] of this._pending) if (value !== r.rawValue && LINEAR_FORMATS.has(q.format)) rival = Math.max(rival, q.count);
-        const strong = r.strategy !== 'greyscale-ean' && RETAIL.has(r.format) && (r.lineCount || 0) >= 12;
+        const strong = !MODEL_BASED.has(r.strategy) && RETAIL.has(r.format) && (r.lineCount || 0) >= 12;
         // Values only the greyscale reader can see come from soft frames: ask for one more frame.
-        const base = r.strategy === 'greyscale-ean' ? this.options.confirmLinear + 1 : this.options.confirmLinear;
+        const base = MODEL_BASED.has(r.strategy) ? this.options.confirmLinear + 1 : this.options.confirmLinear;
         const needed = rival ? Math.max(base, 2 * rival) : (strong ? 1 : base);
         if (p.count < needed) continue;
         this.lastConfirm = { value: r.rawValue, votes: p.count, needed, rival, ms: Math.round(now - p.first) };

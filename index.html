@@ -22,6 +22,8 @@
       font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     main { max-width: 760px; margin: 0 auto; padding: 16px; }
     h1 { font-size: 20px; margin: 0 0 4px; }
+    .version { font-size: 12px; font-weight: 500; color: var(--muted); border: 1px solid var(--line);
+      border-radius: 999px; padding: 1px 8px; vertical-align: middle; white-space: nowrap; }
     .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
     .viewer { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: 12px; overflow: hidden; }
     .viewer video, .viewer canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
@@ -68,7 +70,7 @@
 </head>
 <body>
 <main>
-  <h1>Barcode Scanner</h1>
+  <h1>Barcode Scanner <span class="version" id="version"></span></h1>
   <p class="sub">QR, Data Matrix (incl. GS1), EAN/UPC, Code 128 and more. Decoding runs on this device; the camera image never leaves the browser.</p>
 
   <div class="viewer">
@@ -114,10 +116,12 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=f73d8bf-202611081555';
-  import { parseGS1 } from './gs1.js?v=f73d8bf-202611081555';
+  import { BarcodeScanner, COMMON_FORMATS, VERSION, scanImage } from './scanner.js?v=9fccbc3-202611081635';
+  import { parseGS1 } from './gs1.js?v=9fccbc3-202611081635';
 
   const $ = (id) => document.getElementById(id);
+  $('version').textContent = `Version ${VERSION.label}`;
+  $('version').title = VERSION.stamp;
   const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
   const DEFAULT_ON = ['qr_code', 'data_matrix', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'];
   const GS1_CAPABLE = new Set(['data_matrix', 'code_128', 'qr_code', 'databar', 'databar_expanded', 'databar_limited']);
