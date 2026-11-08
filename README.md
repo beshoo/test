@@ -72,12 +72,13 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 - **1D codes are voted across frames.** EAN check digits pass for 1 wrong code in 10, so every 1D read is a vote kept for 2 s. A value needs 2 votes (3 if only the greyscale reader sees it). If a different 1D value was also seen, it needs at least twice the votes of every rival. Only a ZXing read backed by ≥ 12 scan lines, with no rival, is reported at once. (Added after a phone reported `9277146613147` for `6211136613147`, which had briefly been allowed through on a single frame.)
 - **A built-in detector that never reads is retired.** If `BarcodeDetector` has found nothing after 30 frames while ZXing has read at least 3, it is no longer called.
 - **The box gets priority.** While codes keep turning up in the target box, it is decoded 3 frames out of 4 at full resolution.
+- **The greyscale reader remembers the barcode's angle.** It starts scanning at the angle that worked last time, tries the blur model on those lines first, and stops once 4 lines agree with no rival. Consecutive frames: about 20 ms for sharp codes and 40–60 ms for blurred ones (desktop), down from 70–90 ms.
 - **Templates are built at start-up** (`warmUp()`, in the worker), not on the first frames.
-- `diagnostics()` reports `firstReadMs`, `parallelWorkers` and `nativeRetired`.
+- `diagnostics()` reports `firstReadMs`, `parallelWorkers`, `nativeRetired`, and `cameras` (each back camera checked, with or without autofocus).
 
 ## Camera choice
 
-On multi-camera phones, `facingMode: "environment"` often opens an ultra-wide or secondary lens that can't focus up close. After permission is granted, `start()` switches to the main back camera (`chooseBackCamera()`: lowest-numbered `camera2 N, facing back` on Android; Triple, then Dual Wide, then Back Camera on iOS). The demo remembers a camera picked by hand.
+On multi-camera phones, `facingMode: "environment"` often opens an ultra-wide or secondary lens that can't focus up close. After permission is granted, `start()` switches to the main back camera (`chooseBackCamera()`: lowest-numbered `camera2 N, facing back` on Android; Triple, then Dual Wide, then Back Camera on iOS). The demo remembers a camera picked by hand. If the camera it opens, remembered or not, has no autofocus, `start()` checks the other back cameras and switches to one that has it (`autoSwitched`). A camera picked from the list during the session is kept as chosen.
 
 ## Known limits
 

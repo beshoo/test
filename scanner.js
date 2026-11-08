@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=3850c10-202611080044';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=ce2af1d-202611080057';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=3850c10-202611080044', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=ce2af1d-202611080057', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=3850c10-202611080044', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=ce2af1d-202611080057', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -349,7 +349,8 @@ export class BarcodeScanner {
     return devices.filter((d) => d.kind === 'videoinput');
   }
 
-  async start() {
+  /** @param {{probe?: boolean}} [opts] probe: look for an autofocus camera if this one has none */
+  async start({ probe = true } = {}) {
     if (this._running) return;
     if (!window.isSecureContext) throw new Error('Camera access requires HTTPS (or localhost).');
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser has no camera API.');
@@ -366,34 +367,43 @@ export class BarcodeScanner {
     this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
 
     // Labels are only readable after permission: now switch to the main back camera if needed.
-    if (!this.options.deviceId) {
-      try {
+    this.autoSwitched = null;
+    this.cameraReport = [];
+    try {
+      if (!this.options.deviceId) {
         const best = chooseBackCamera(await BarcodeScanner.listCameras());
         const current = this.track?.getSettings?.().deviceId;
         if (best && best.deviceId && best.deviceId !== current) {
           this.stream.getTracks().forEach((t) => t.stop());
           this.stream = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: best.deviceId } }));
         }
-        // A camera without autofocus (often an ultra-wide or macro lens) gives soft
-        // images at barcode distance. Probe the other back cameras for one that has it.
-        if (!hasAutofocus(this.track)) {
-          const others = (await BarcodeScanner.listCameras())
-            .filter((d) => /back|rear|environment/i.test(d.label) && d.deviceId !== this.track?.getSettings?.().deviceId)
-            .slice(0, 4);
-          for (const d of others) {
-            const probe = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: d.deviceId } })).catch(() => null);
-            if (!probe) continue;
-            if (hasAutofocus(probe.getVideoTracks()[0])) {
-              this.stream.getTracks().forEach((t) => t.stop());
-              this.stream = probe;
-              break;
-            }
-            probe.getTracks().forEach((t) => t.stop());
-          }
-        }
-      } catch {
-        if (!this.stream?.active) this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
       }
+      // A camera without autofocus (often an ultra-wide or macro lens) gives soft
+      // images at barcode distance. Probe the other back cameras for one that has it,
+      // also when this camera was remembered from an earlier visit; a camera picked
+      // from the list during this session (probe: false) is left alone.
+      this.cameraReport.push({ camera: this.track?.label, autofocus: hasAutofocus(this.track) });
+      if (probe && !hasAutofocus(this.track)) {
+        const from = this.track?.label;
+        const others = (await BarcodeScanner.listCameras())
+          .filter((d) => /back|rear|environment/i.test(d.label) && d.deviceId !== this.track?.getSettings?.().deviceId)
+          .slice(0, 5);
+        for (const d of others) {
+          const trial = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: d.deviceId } })).catch(() => null);
+          if (!trial) { this.cameraReport.push({ camera: d.label, autofocus: null, note: 'could not open' }); continue; }
+          const af = hasAutofocus(trial.getVideoTracks()[0]);
+          this.cameraReport.push({ camera: d.label, autofocus: af });
+          if (af) {
+            this.stream.getTracks().forEach((t) => t.stop());
+            this.stream = trial;
+            this.autoSwitched = { from, to: d.label, deviceId: d.deviceId };
+            break;
+          }
+          trial.getTracks().forEach((t) => t.stop());
+        }
+      }
+    } catch {
+      if (!this.stream?.active) this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
     }
     this.autofocus = hasAutofocus(this.track);
 
@@ -431,7 +441,7 @@ export class BarcodeScanner {
     this.options.deviceId = deviceId || undefined;
     if (this._running) {
       this.stop();
-      await this.start();
+      await this.start({ probe: false }); // the user chose this camera: keep it
     }
   }
 
@@ -458,6 +468,8 @@ export class BarcodeScanner {
       video: this.video.videoWidth ? `${this.video.videoWidth}x${this.video.videoHeight}` : null,
       focusMode: st.focusMode ?? null,
       autofocus: this.autofocus ?? null,
+      cameras: this.cameraReport ?? null,
+      autoSwitched: this.autoSwitched ? `${this.autoSwitched.from} -> ${this.autoSwitched.to}` : null,
       focusModes: caps.focusMode ?? null,
       zoom: caps.zoom ? `${st.zoom ?? '?'} (${caps.zoom.min}-${caps.zoom.max})` : null,
       torch: Boolean(caps.torch),
