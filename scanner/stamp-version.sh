@@ -12,5 +12,6 @@ stamp index.html gs1.js
 stamp scanner.js engine/decode-core.js
 stamp scanner.js engine/worker.js
 stamp engine/worker.js decode-core.js
+stamp engine/decode-core.js ean-grey.js
 echo "stamped v=${v}"
 grep -n "?v=" index.html scanner.js engine/worker.js

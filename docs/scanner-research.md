@@ -51,6 +51,34 @@ What each piece contributes:
 5. **Camera**: continuous autofocus, tap-to-focus, zoom slider and torch where the device supports them, and 1080p capture.
 6. **Web Worker decoding**, so the preview and UI never stall.
 
+## 2b. Greyscale EAN/UPC reader (`scanner/engine/ean-grey.js`), added 2026-11-08
+
+**Trigger:** on a user's Android phone a plain EAN-13 (`6211136613147`) would not scan, while Scandit read it. ZXing read the same code from a still photo, but not from the live frame. A scan line across that frame shows why: thresholding found 24–28 dark bars where an EAN-13 has exactly 30. The thin white gaps between thick bars had blurred shut, and glare on the glossy pack made the dark bars print thin. Android's ML Kit also returned nothing. The phone had opened a back camera with no autofocus (`focusModes: ["manual"]`).
+
+**Method** (Scandit technique #1, built from the public literature):
+1. *Edge reader:* bar edges from local extremes of the brightness gradient, at sub-pixel precision, with no threshold. All 30 bars are found on the user's frame.
+2. *Blur-model reader* (after Rocholl et al. 2010): find only the two outer ends, map the 95 modules across them with a 1-D perspective term, estimate blur σ and bar-width bias from the three guard patterns, then beam-search the 12 digits. Each candidate digit is rendered next to its already-decoded neighbour, blurred, and scored by 1 − R² against the brightness profile.
+3. *Acceptance:* valid check digit; average digit misfit ≤ 0.2 and a ≥ 2% lead over the next beam sequence (on 119 synthetic model reads, every wrong read failed both); edge-reader worst-digit error ≤ 1.3 (every wrong edge read was ≥ 1.35); an edge read is dropped if the blur model reads a different valid code on the same span; at least two scan lines must agree; and the live scanner adds two-frame confirmation.
+
+**Results** (same synthetic EAN-13 images for both; 20 random codes per row; blur σ in modules):
+
+| Condition | ZXing, all 5 strategies | Greyscale reader |
+|---|---|---|
+| Sharp | 11/20 | 20/20 |
+| Blur 0.5 | 12/20 | 20/20 |
+| Blur 0.6 | 0/20 | 20/20 |
+| Blur 0.7 | 0/20 | 13/20 |
+| Blur 0.7 + perspective | 0/20 | 14/20 |
+| Blur 0.7 + noise | 0/20 | 13/20 |
+| Blur 0.8 + thin bars | 0/20 | 8/20 |
+| Blur 0.6 + thick bars | 0/20 | 18/20 |
+| Small (2.5 px/module) + blur 0.6 | 20/20 | 20/20 |
+| Blur 0.9 | 0/20 | 0/20 |
+
+Wrong values: 0 here, 0 in a further 600-case stress suite, and 0 on the 216-frame benchmark. The user's live phone frame now reads in about 55–70 ms (warm, desktop CPU). It adds nothing on the 216-frame benchmark, whose EAN frames are either sharp enough for ZXing or blurred by about 1 module, beyond this reader's range (≈0.8 module).
+
+**Camera:** the scanner now probes the back cameras for one with continuous autofocus, and warns when the chosen camera has none.
+
 ## 3. The honest gap
 
 Heavy defocus and motion blur stay at **0%**. That is the core of Scandit's advantage (#1) and can't be fixed by preprocessing before ZXing, because ZXing's first step (black-and-white conversion) destroys the information. Options, in order of value:

@@ -111,8 +111,8 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=ea7b05a-202611080003';
-  import { parseGS1 } from './gs1.js?v=ea7b05a-202611080003';
+  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=1ad4166-202611080027';
+  import { parseGS1 } from './gs1.js?v=1ad4166-202611080027';
 
   const $ = (id) => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
@@ -172,6 +172,9 @@
       $('engine').textContent = ENGINE_LABEL[scanner.engine.name] ?? scanner.engine.name;
       $('engine').hidden = false;
       setupCameraControls();
+      if (scanner.autofocus === false) {
+        showError(new Error('This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
+      }
       $('idle').hidden = true; $('guide').hidden = false;
       drawLoop();
     } catch (err) {
@@ -294,7 +297,11 @@
   $('toggle').onclick = () => (scanner.running ? stop() : start());
   $('camera').onchange = async (e) => {
     saveCamera(e.target.value);
-    try { await scanner.switchCamera(e.target.value); setupCameraControls(); drawLoop(); }
+    try {
+      await scanner.switchCamera(e.target.value);
+      showError(scanner.autofocus ? null : new Error('This camera has no autofocus, so barcodes up close will look blurry. Pick another camera from the list.'));
+      setupCameraControls(); drawLoop();
+    }
     catch (err) { showError(err); syncUi(); }
   };
   $('copyDiag').onclick = () => {

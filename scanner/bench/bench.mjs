@@ -39,21 +39,27 @@ for (const f of manifest) {
   const base = (await zx.readBarcodes(full, { tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, textMode: 'Plain' }))
     .filter((r) => r.isValid).map((r) => ({ rawValue: r.text }));
   times.base += performance.now() - t0; times.n++;
-  const r = { base: hit(base, f.code), roi0: false, ladderFull: false, pipeline: false }; if (wrong(base, f.code)) misreadsV1++;
+  const r = { base: hit(base, f.code), roi0: false, ladderFull: false, grey: false, pipeline: false }; if (wrong(base, f.code)) misreadsV1++;
   for (let s = 0; s < STRATEGIES.length; s++) {
-    const a = await dec.decodeOnce(roi, { strategy: s });
-    const b = await dec.decodeOnce(full, { strategy: s });
+    const a = await dec.decodeOnce(roi, { strategy: s, greyEan: false });
+    const b = await dec.decodeOnce(full, { strategy: s, greyEan: false });
     if (wrong(a, f.code) || wrong(b, f.code)) misreadsNew++;
     if (s === 0 && hit(a, f.code)) r.roi0 = true;
     if (hit(b, f.code)) r.ladderFull = true;
     if (hit(a, f.code) || hit(b, f.code)) r.pipeline = true;
   }
+  // greyscale EAN/UPC reader (runs live when ZXing finds nothing): once per pass type
+  for (const img2 of [roi, full]) {
+    const g = await dec.decodeOnce(img2, { zxing: false, greyEan: true });
+    if (wrong(g, f.code)) misreadsNew++;
+    if (hit(g, f.code)) { r.grey = true; r.pipeline = true; }
+  }
   for (const k of [f.kind, `code:${f.code}`, 'ALL']) {
-    rows[k] ??= { n: 0, base: 0, roi0: 0, ladderFull: 0, pipeline: 0 };
-    rows[k].n++; for (const m of ['base', 'roi0', 'ladderFull', 'pipeline']) rows[k][m] += r[m] ? 1 : 0;
+    rows[k] ??= { n: 0, base: 0, roi0: 0, ladderFull: 0, grey: 0, pipeline: 0 };
+    rows[k].n++; for (const m of ['base', 'roi0', 'ladderFull', 'grey', 'pipeline']) rows[k][m] += r[m] ? 1 : 0;
   }
 }
 const pct = (a, n) => `${Math.round((100 * a) / n)}%`.padStart(5);
-console.log('condition'.padEnd(14), 'frames', ' v1 (1 try)', ' +ROI', ' +ladder', ' full pipeline');
-for (const [k, v] of Object.entries(rows)) console.log(k.padEnd(14), String(v.n).padStart(6), pct(v.base, v.n).padStart(11), pct(v.roi0, v.n), pct(v.ladderFull, v.n).padStart(8), pct(v.pipeline, v.n).padStart(14));
+console.log('condition'.padEnd(14), 'frames', ' v1 (1 try)', ' +ROI', ' +ladder', ' greyscale', ' full pipeline');
+for (const [k, v] of Object.entries(rows)) console.log(k.padEnd(14), String(v.n).padStart(6), pct(v.base, v.n).padStart(11), pct(v.roi0, v.n), pct(v.ladderFull, v.n).padStart(8), pct(v.grey, v.n).padStart(10), pct(v.pipeline, v.n).padStart(14));
 console.log(`avg single attempt (1280px frame): ${(times.base / times.n).toFixed(1)} ms; wrong values: v1 ${misreadsV1} frames, new pipeline ${misreadsNew} attempts`);
