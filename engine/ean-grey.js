@@ -311,7 +311,7 @@ const BEAM = 5;
 const MAX_DIGIT_MISFIT = 0.2; // average 1 - R^2 per digit
 const MIN_LEAD = 1.02;        // best sequence must beat the runner-up by 2%
 const MODEL_MAX_LINES = 24;   // blur-model attempts per frame
-const MODEL_BUDGET_MS = 120;  // and time budget per frame
+const MODEL_BUDGET_MS = 70;   // and time budget per frame (fail fast, the next frame may be sharper)
 function beamDigits(segAt, h) {
   const START_TAIL = [0, 1];            // start guard 101 -> last two modules
   const MID_TAIL = [1, 0];              // middle guard 01010 -> last two modules

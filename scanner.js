@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=eb25706-202611080100';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=6790fe6-202611080102';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=eb25706-202611080100', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=6790fe6-202611080102', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=eb25706-202611080100', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=6790fe6-202611080102', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -588,10 +588,11 @@ export class BarcodeScanner {
   _plan(vw, vh) {
     const pass = this._pass++;
     const needsDownscale = Math.max(vw, vh) > this.options.maxDecodeSize;
-    // Alternate box / whole frame; while codes keep turning up in the box, give it
-    // three passes out of four.
+    // The box gets most passes (users aim at it): 3 of 4, and 7 of 8 while codes keep
+    // turning up there. Whole-frame passes remain as a fallback for codes outside it.
+    // (On a phone, 12 of 41 whole-frame passes read nothing while the code sat in the box.)
     const boxBusy = performance.now() - (this._lastRoiHitAt || -1e9) < 3000;
-    const roiPass = needsDownscale && (boxBusy ? pass % 4 !== 3 : pass % 2 === 0);
+    const roiPass = needsDownscale && (boxBusy ? pass % 8 !== 7 : pass % 4 !== 3);
     const strategy = (roiPass ? this._roiPasses++ : this._fullPasses++) % STRATEGIES.length;
     if (roiPass) {
       const r = this._region(vw, vh);
