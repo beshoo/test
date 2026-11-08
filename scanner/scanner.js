@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=9b5d238-202611080034';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=3850c10-202611080044';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=9b5d238-202611080034', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=3850c10-202611080044', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=9b5d238-202611080034', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=3850c10-202611080044', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -85,15 +85,15 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true }) {
+  async decodeImage(image, { formats, strategy, offset, all = false, greyEan = true, tryRotate }) {
     const img = { data: image.data, width: image.width, height: image.height };
     if (!greyEan || all || !this._g) {
-      return this._w.call({ image: img, formats, strategy, offset, all, greyEan }, [image.data.buffer]);
+      return this._w.call({ image: img, formats, strategy, offset, all, greyEan, tryRotate }, [image.data.buffer]);
     }
     // Parallel: ZXing in one worker, the greyscale reader in the other (on a copy).
     const copy = { data: new Uint8ClampedArray(image.data), width: image.width, height: image.height };
     const [z, g] = await Promise.allSettled([
-      this._w.call({ image: img, formats, strategy, offset, greyEan: false }, [image.data.buffer]),
+      this._w.call({ image: img, formats, strategy, offset, greyEan: false, tryRotate }, [image.data.buffer]),
       this._g.call({ image: copy, formats, offset }, [copy.data.buffer]),
     ]);
     if (z.status === 'rejected' && g.status === 'rejected') throw z.reason;
@@ -560,7 +560,7 @@ export class BarcodeScanner {
     const strategy = (roiPass ? this._roiPasses++ : this._fullPasses++) % STRATEGIES.length;
     if (roiPass) {
       const r = this._region(vw, vh);
-      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true };
+      return { sx: r.x, sy: r.y, sw: r.width, sh: r.height, scale: 1, strategy, greyEan: true, tryRotate: false };
     }
     const scale = Math.min(1, this.options.maxDecodeSize / Math.max(vw, vh));
     // without a separate region pass (small video), the whole frame is full resolution
@@ -592,7 +592,7 @@ export class BarcodeScanner {
       const engine = this.engine;
       const frame = { canvas: this._canvas, ctx: this._ctx, width: w, height: h };
       const t0 = performance.now();
-      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan });
+      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy, greyEan: plan.greyEan, tryRotate: plan.tryRotate });
       const dt = performance.now() - t0;
       this.stats.frames += 1;
       this.stats.decodeMs += dt;
@@ -633,19 +633,33 @@ export class BarcodeScanner {
   }
 
   /** Multi-frame confirmation for 1D codes + duplicate suppression. */
+  /**
+   * Decide which reads to report. 1D codes have weak checksums (a wrong EAN passes
+   * its check digit 1 time in 10), so for them:
+   *   - every read is a vote, kept for 2 s;
+   *   - a value needs `confirmLinear` (2) votes, 3 if only the greyscale reader
+   *     sees it (soft frames), or 1 for a ZXing read backed by >= 12 scan lines
+   *     (ghost reads had 5, real ones ~49) with no rival;
+   *   - if a different 1D value was also seen in the last 2 s, a value must have at
+   *     least twice the votes of every rival. A rare bad frame cannot win against
+   *     the real code, which shows up on most frames.
+   * 2D codes (strong error correction) are reported at once.
+   */
   _accept(results, now) {
     const out = [];
-    for (const [value, p] of this._pending) if (now - p.t > 1500) this._pending.delete(value);
+    for (const [value, p] of this._pending) if (now - p.t > 2000) this._pending.delete(value);
     for (const r of results) {
-      // Retail codes with a strong read skip the second frame: their check digit
-      // passed, and many scan lines agreed (ghost reads had 5 ZXing lines, real 49).
-      const strong = RETAIL.has(r.format) && (r.strategy === 'greyscale-ean' ? (r.lineCount || 0) >= 3 : (r.lineCount || 0) >= 12);
-      const needed = LINEAR_FORMATS.has(r.format) && !strong ? this.options.confirmLinear : 1;
-      if (needed > 1) {
-        const p = this._pending.get(r.rawValue) ?? { count: 0, t: now };
+      if (LINEAR_FORMATS.has(r.format)) {
+        const p = this._pending.get(r.rawValue) ?? { count: 0, t: now, format: r.format };
         p.count += 1;
         p.t = now;
         this._pending.set(r.rawValue, p);
+        let rival = 0;
+        for (const [value, q] of this._pending) if (value !== r.rawValue && LINEAR_FORMATS.has(q.format)) rival = Math.max(rival, q.count);
+        const strong = r.strategy !== 'greyscale-ean' && RETAIL.has(r.format) && (r.lineCount || 0) >= 12;
+        // Values only the greyscale reader can see come from soft frames: ask for one more frame.
+        const base = r.strategy === 'greyscale-ean' ? this.options.confirmLinear + 1 : this.options.confirmLinear;
+        const needed = rival ? Math.max(base, 2 * rival) : (strong ? 1 : base);
         if (p.count < needed) continue;
       }
       const last = this._seen.get(r.rawValue);

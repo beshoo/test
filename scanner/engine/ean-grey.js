@@ -545,6 +545,53 @@ function readWidths(line, wantEan13, wantEan8) {
 }
 
 /**
+ * Outline of the whole barcode from the agreeing scan lines: each line knows where
+ * the barcode starts and ends along it. Project those end points onto the reading
+ * direction and its perpendicular and take the extent; the bars run perpendicular
+ * to the scan lines, so extend that way to cover their full height.
+ */
+function barcodeOutline(spans) {
+  if (!spans.length) return null;
+  // Bar direction: the start points of the agreeing lines lie on the barcode's left
+  // edge and the end points on its right edge, so the line through them runs along
+  // the bars. Scan lines can cross the code diagonally, so their own direction is
+  // not the barcode's axis. With a single line (or lines too close together),
+  // assume the bars are perpendicular to the scan line.
+  let bx = -spans[0].dy, by = spans[0].dx;
+  if (spans.length >= 2) {
+    let best = 0;
+    for (let i = 0; i < spans.length; i += 1) {
+      for (let j = i + 1; j < spans.length; j += 1) {
+        // start-to-start and end-to-end both run along the bars; when the lines
+        // cross in an X they point opposite ways, so align them before adding
+        const sx = spans[j].ax - spans[i].ax, sy = spans[j].ay - spans[i].ay;
+        let tx = spans[j].bx - spans[i].bx, ty = spans[j].by - spans[i].by;
+        if (sx * tx + sy * ty < 0) { tx = -tx; ty = -ty; }
+        const ex = sx + tx, ey = sy + ty;
+        const d = Math.hypot(ex, ey);
+        if (d > best) { best = d; bx = ex / d; by = ey / d; }
+      }
+    }
+    if (best < 20) { bx = -spans[0].dy; by = spans[0].dx; }
+  }
+  // Barcode axis: perpendicular to the bars, pointing from start to end.
+  let ax = by, ay = -bx;
+  if ((spans[0].bx - spans[0].ax) * ax + (spans[0].by - spans[0].ay) * ay < 0) { ax = -ax; ay = -ay; }
+  let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+  for (const sp of spans) {
+    u0 = Math.min(u0, sp.ax * ax + sp.ay * ay); u1 = Math.max(u1, sp.bx * ax + sp.by * ay);
+    for (const [x, y] of [[sp.ax, sp.ay], [sp.bx, sp.by]]) { const v = x * bx + y * by; v0 = Math.min(v0, v); v1 = Math.max(v1, v); }
+  }
+  const len = u1 - u0;
+  if (!(len > 0)) return null;
+  // EAN bars are about 0.7x the symbol width tall; centre that on the agreeing lines
+  const mid = (v0 + v1) / 2, half = Math.max((v1 - v0) / 2, len * 0.35);
+  v0 = mid - half; v1 = mid + half;
+  const pt = (u, v) => ({ x: u * ax + v * bx, y: u * ay + v * by });
+  return [pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1)];
+}
+
+/**
  * @param {{data: Uint8ClampedArray, width: number, height: number}} img RGBA
  * @param {string[]} formats requested formats ([] = all)
  * @returns {{rawValue: string, format: string, lines: number, cornerPoints: {x,y}[]}[]}
@@ -597,7 +644,7 @@ export function decodeEanGrey(img, formats = []) {
         if (!read.length && wantEan13) {
           for (const c of modelCandidates(line)) {
             // most EAN-like first: 59 elements nominal, a few merged by blur
-            modelQueue.push({ line, c, sx, sy, dx, dy, n, pri: Math.abs(c.elements - 57) + Math.abs(off) / half });
+            modelQueue.push({ line, c, sx, sy, dx, dy, n, dir, pri: Math.abs(c.elements - 57) + Math.abs(off) / half });
           }
         }
         for (const r of read) {
@@ -608,12 +655,17 @@ export function decodeEanGrey(img, formats = []) {
             if (mt && mt !== r.text) { contradicted.add(r.text); continue; }
             verified.set(r.text, (verified.get(r.text) ?? 0) + 1);
           }
-          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], methods: new Set() };
+          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], spans: [], methods: new Set() };
           v.methods.add(r.method || 'edges');
           v.count += 1;
           // approximate location: the scan line's midpoint
           const mid = n / 2;
           v.pts.push({ x: sx + dx * mid, y: sy + dy * mid });
+          if (r.xa != null) {
+            // on the reversed pass, positions count from the other end of the line
+            const a = dir ? n - 1 - r.xa : r.xa, b = dir ? n - 1 - r.xb : r.xb;
+            v.spans.push({ ax: sx + dx * a, ay: sy + dy * a, bx: sx + dx * b, by: sy + dy * b, dx, dy });
+          }
           votes.set(r.text, v);
         }
       }
@@ -632,10 +684,12 @@ export function decodeEanGrey(img, formats = []) {
       tried += 1;
       const text = modelLine(q.line.profile, q.n, q.c.xa, q.c.xb);
       if (!text) continue;
-      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], methods: new Set() };
+      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], spans: [], methods: new Set() };
       v.methods.add('model');
       v.count += 1;
       v.pts.push({ x: q.sx + q.dx * q.n / 2, y: q.sy + q.dy * q.n / 2 });
+      const a = q.dir ? q.n - 1 - q.c.xa : q.c.xa, b = q.dir ? q.n - 1 - q.c.xb : q.c.xb;
+      v.spans.push({ ax: q.sx + q.dx * a, ay: q.sy + q.dy * a, bx: q.sx + q.dx * b, by: q.sy + q.dy * b, dx: q.dx, dy: q.dy });
       votes.set(text, v);
       if (agreed()) break;
     }
@@ -647,6 +701,7 @@ export function decodeEanGrey(img, formats = []) {
     if (contradicted.has(text)) continue; // the blur model read something else on one of its lines
     const xs = v.pts.map((p) => p.x), ys = v.pts.map((p) => p.y);
     const x0 = Math.min(...xs) - 20, x1 = Math.max(...xs) + 20, y0 = Math.min(...ys) - 20, y1 = Math.max(...ys) + 20;
+    const outline = barcodeOutline(v.spans);
     let format = v.format, value = text;
     if (format === 'ean_13' && !want('ean_13') && text.startsWith('0')) { format = 'upc_a'; value = text.slice(1); }
     if (format === 'ean_13' && !want('ean_13') && !text.startsWith('0')) continue;
@@ -655,7 +710,7 @@ export function decodeEanGrey(img, formats = []) {
       format,
       lines: v.count,
       method: [...v.methods].join('+'),
-      cornerPoints: [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }],
+      cornerPoints: outline ?? [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }],
     });
   }
   // Several values in one frame: either several barcodes, or one barcode read two ways.

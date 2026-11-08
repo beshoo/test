@@ -77,6 +77,8 @@ What each piece contributes:
 
 Wrong values: 0 here, 0 in a further 600-case stress suite, and 0 on the 216-frame benchmark. The user's live phone frame now reads in about 55–70 ms (warm, desktop CPU). It adds nothing on the 216-frame benchmark, whose EAN frames are either sharp enough for ZXing or blurred by about 1 module, beyond this reader's range (≈0.8 module).
 
+**Wrong read in the field (2026-11-08).** After a speed change that let a strong single-frame greyscale read through without a second frame, the user's phone reported `9277146613147` for `6211136613147`. The right half was correct; the left digits and parity were wrong, and the check digit still passed. It could not be reproduced from the screenshot frame or from 600 degraded variants of the user's frames (0 wrong). So the fix is structural, in the scanner's vote: no single-frame shortcut for greyscale reads; they need 3 frames (others 2); and any rival 1D value seen in the last 2 s forces a 2:1 majority. A scripted check confirms that one bad frame, or a bad pair before the real code, is never reported.
+
 **Camera:** the scanner now probes the back cameras for one with continuous autofocus, and warns when the chosen camera has none.
 
 ## 3. The honest gap
