@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=6790fe6-202611080102';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=c6f5898-202611080111';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=6790fe6-202611080102', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=c6f5898-202611080111', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=6790fe6-202611080102', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=c6f5898-202611080111', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -473,6 +473,8 @@ export class BarcodeScanner {
       parallelWorkers: (this.engine?.zxing ?? this.engine)?.parallel ?? null,
       firstSeenMs: this.firstSeenMs,
       firstReadMs: this.firstReadMs,
+      lastConfirm: this.lastConfirm ?? null,
+      unconfirmed: this.unconfirmed ?? [],
       passes: Object.fromEntries(Object.entries(this.passStats ?? {}).map(([k, v]) => [k,
         `${v.reads}/${v.attempts} frames read, ${v.attempts ? Math.round(v.ms / v.attempts) : 0} ms each`])),
       engineErrors: this.engine?.errors ?? null,
@@ -689,11 +691,20 @@ export class BarcodeScanner {
    */
   _accept(results, now) {
     const out = [];
-    for (const [value, p] of this._pending) if (now - p.t > 2000) this._pending.delete(value);
+    for (const [value, p] of this._pending) {
+      if (now - p.t <= 2000) continue;
+      // remember values that expired without being reported (possible wrong reads)
+      if (!this._seen.has(value)) {
+        this.unconfirmed = [...(this.unconfirmed ?? []).filter((u) => u.value !== value), { value, votes: p.count }].slice(-5);
+      }
+      this._pending.delete(value);
+    }
     for (const r of results) {
       if (LINEAR_FORMATS.has(r.format)) {
-        const p = this._pending.get(r.rawValue) ?? { count: 0, t: now, format: r.format };
-        p.count += 1;
+        const p = this._pending.get(r.rawValue) ?? { count: 0, t: now, first: now, format: r.format };
+        // A greyscale frame with strong evidence counts twice: its two methods (bar
+        // edges and blur model) agree, or >= 3 scan lines from >= 2 angles agree.
+        p.count += r.strategy === 'greyscale-ean' && r.strong ? 2 : 1;
         p.t = now;
         this._pending.set(r.rawValue, p);
         let rival = 0;
@@ -703,6 +714,7 @@ export class BarcodeScanner {
         const base = r.strategy === 'greyscale-ean' ? this.options.confirmLinear + 1 : this.options.confirmLinear;
         const needed = rival ? Math.max(base, 2 * rival) : (strong ? 1 : base);
         if (p.count < needed) continue;
+        this.lastConfirm = { value: r.rawValue, votes: p.count, needed, rival, ms: Math.round(now - p.first) };
       }
       const last = this._seen.get(r.rawValue);
       this._seen.set(r.rawValue, now);

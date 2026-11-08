@@ -195,31 +195,35 @@ function modelLine(p, n, xa0, xb0) {
   const guardErr = (seg, r, bi, si) => fitErr(seg(r, 0, 3), GUARD3[bi][si]) + fitErr(seg(r, 45, 5), GUARD5[bi][si]) + fitErr(seg(r, 92, 3), GUARD3[bi][si]);
 
   // 0. refine the outer ends: blur smears the outermost thin bars, so the detected
-  //    edges drift. Try corrections of up to +-1 module and keep the best two.
+  //    edges drift. Coarse grid (half-module steps, +-1 module), then refine
+  //    around the best by quarter modules.
   const m0 = (xb0 - xa0) / 95;
-  const OFFS = [-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1];
-  const ends = [];
-  for (const da of OFFS) {
-    for (const db of OFFS) {
-      const xa = xa0 + da * m0, xb = xb0 + db * m0;
-      const seg = segAtX(xa, xb);
-      const s0 = seg(1, 0, 3), s1 = seg(1, 45, 5), s2 = seg(1, 92, 3);
-      let e = Infinity;
-      for (let bi = 0; bi < BIASES.length; bi += 1) {
-        for (let si = 0; si < SIGMAS.length; si += 1) {
-          e = Math.min(e, fitErr(s0, GUARD3[bi][si]) + fitErr(s1, GUARD5[bi][si]) + fitErr(s2, GUARD3[bi][si]));
-        }
+  const endErr = (xa, xb) => {
+    const seg = segAtX(xa, xb);
+    const s0 = seg(1, 0, 3), s1 = seg(1, 45, 5), s2 = seg(1, 92, 3);
+    let e = Infinity;
+    for (let bi = 0; bi < BIASES.length; bi += 1) {
+      for (let si = 0; si < SIGMAS.length; si += 1) {
+        e = Math.min(e, fitErr(s0, GUARD3[bi][si]) + fitErr(s1, GUARD5[bi][si]) + fitErr(s2, GUARD3[bi][si]));
       }
-      ends.push({ xa, xb, e });
     }
-  }
-  ends.sort((a, b) => a.e - b.e);
+    return e;
+  };
+  const tried = new Map();
+  const evalEnd = (da, db) => {
+    const key = `${da},${db}`;
+    if (!tried.has(key)) tried.set(key, { xa: xa0 + da * m0, xb: xb0 + db * m0, da, db, e: endErr(xa0 + da * m0, xb0 + db * m0) });
+    return tried.get(key);
+  };
+  for (const da of [-1, -0.5, 0, 0.5, 1]) for (const db of [-1, -0.5, 0, 0.5, 1]) evalEnd(da, db);
+  const coarse = [...tried.values()].sort((a, b) => a.e - b.e)[0];
+  for (const da of [-0.25, 0, 0.25]) for (const db of [-0.25, 0, 0.25]) evalEnd(coarse.da + da, coarse.db + db);
+  const ends = [...tried.values()].sort((a, b) => a.e - b.e);
 
-  const cands = [];
+  // 1. perspective, bias and blur from the guards, for the best two end placements
+  const hyps = [];
   for (const end of ends.slice(0, 2)) {
     const segAt = segAtX(end.xa, end.xb);
-    // 1. perspective, bias and blur from the guards
-    const perBias = [];
     for (let bi = 0; bi < BIASES.length; bi += 1) {
       let best = { err: Infinity };
       for (const r of R_GRID) {
@@ -228,15 +232,13 @@ function modelLine(p, n, xa0, xb0) {
           if (e < best.err) best = { err: e, r, si };
         }
       }
-      perBias.push({ bi, ...best });
-    }
-    perBias.sort((a, b) => a.err - b.err);
-    // 2. digits by beam search, for the best few bias hypotheses
-    for (const h of perBias.slice(0, 3)) {
-      if (!Number.isFinite(h.err) || h.err > 2.0) continue;
-      for (const res of beamDigits(segAt, h)) cands.push(res);
+      if (Number.isFinite(best.err) && best.err <= 2.0) hyps.push({ bi, ...best, segAt });
     }
   }
+  hyps.sort((a, b) => a.err - b.err);
+  // 2. digits by beam search, for the best three hypotheses overall
+  const cands = [];
+  for (const h of hyps.slice(0, 3)) for (const res of beamDigits(h.segAt, h)) cands.push(res);
   if (!cands.length) return null;
   cands.sort((a, b) => a.fit - b.fit);
   const rival = cands.find((c) => c.text !== cands[0].text);
@@ -647,16 +649,20 @@ export function decodeEanGrey(img, formats = []) {
   const LINES = 13;
   const modelQueue = [];
   const verified = new Map();   // edge-read value -> model checks passed
+  const bothAgree = new Set();  // values the edge reader and the blur model both read on one line
   const contradicted = new Set(); // edge-read values the model disagreed with
 
   // Blur model on lines the edge reader could not read, within a time budget,
   // stopping as soon as two lines agree on a value. Called early with the lines
   // near the last good angle, and again after all angles.
-  const agreed = () => [...votes.values()].some((v) => v.count >= 2);
-  const modelStart = Date.now();
+  // Stop at 3 agreeing lines (not 2): a third line from another angle turns this
+  // frame into strong evidence (see `strong` below), which halves confirmation time.
+  const agreed = () => [...votes.values()].some((v) => v.count >= 3);
+  let modelStart = 0; // the budget covers model time only, not the edge scan before it
   let tried = 0;
   const runModel = () => {
     if (agreed() || !modelQueue.length) return;
+    if (!modelStart) modelStart = Date.now();
     modelQueue.sort((a, b) => a.pri - b.pri);
     while (modelQueue.length) {
       if (tried >= MODEL_MAX_LINES || Date.now() - modelStart > MODEL_BUDGET_MS) return;
@@ -664,8 +670,9 @@ export function decodeEanGrey(img, formats = []) {
       tried += 1;
       const text = modelLine(q.line.profile, q.n, q.c.xa, q.c.xb);
       if (!text) continue;
-      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], spans: [], methods: new Set(), angle: q.deg };
+      const v = votes.get(text) ?? { count: 0, format: 'ean_13', pts: [], spans: [], methods: new Set(), angle: q.deg, angles: new Set() };
       v.methods.add('model');
+      v.angles.add(q.deg);
       v.count += 1;
       v.pts.push({ x: q.sx + q.dx * q.n / 2, y: q.sy + q.dy * q.n / 2 });
       const a = q.dir ? q.n - 1 - q.c.xa : q.c.xa, b = q.dir ? q.n - 1 - q.c.xb : q.c.xb;
@@ -725,10 +732,12 @@ export function decodeEanGrey(img, formats = []) {
           if (r.method === 'edges' && r.xa != null && (verified.get(r.text) ?? 0) < 2) {
             const mt = modelLine(line.profile, line.n, r.xa, r.xb);
             if (mt && mt !== r.text) { contradicted.add(r.text); continue; }
+            if (mt === r.text) bothAgree.add(r.text); // two independent methods, same value
             verified.set(r.text, (verified.get(r.text) ?? 0) + 1);
           }
-          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], spans: [], methods: new Set(), angle: deg };
+          const v = votes.get(r.text) ?? { count: 0, format: r.format, pts: [], spans: [], methods: new Set(), angle: deg, angles: new Set() };
           v.methods.add(r.method || 'edges');
+          v.angles.add(deg);
           v.count += 1;
           // approximate location: the scan line's midpoint
           const mid = n / 2;
@@ -761,6 +770,10 @@ export function decodeEanGrey(img, formats = []) {
       format,
       lines: v.count,
       method: [...v.methods].join('+'),
+      // edge reader and blur model independently agree (same line, or different lines)
+      crossChecked: bothAgree.has(text) || (v.methods.has('edges') && v.methods.has('model')),
+      // strong single-frame evidence: two methods agree, or >= 3 lines from >= 2 angles
+      strong: bothAgree.has(text) || (v.methods.has('edges') && v.methods.has('model')) || (v.count >= 3 && v.angles.size >= 2),
       cornerPoints: outline ?? [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }],
     });
   }
