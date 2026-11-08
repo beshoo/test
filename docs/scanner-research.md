@@ -99,9 +99,46 @@ Wrong values: 0 here, 0 in a further 600-case stress suite, and 0 on the 216-fra
 | Original 216-frame benchmark | | no condition worse; Code 128 noise 5→6/6, glare 4→6/6; noisy frames 2–3× faster |
 | Wrong values | 0 | 0 |
 
+## 2d. Motion blur and defocus: deblurring located 1D codes (2026-11-08)
+
+**Why it now works:** once the localizer knows a code's axis, every line across the bars carries the same 1D signal. Averaging 16–64 such lines, sampled once from the camera frame at half-pixel steps, gives a profile with ~8× less noise. Only blur *across* the bars matters, so 2D deblurring becomes 1D. Classic Wiener deconvolution is then practical (Gonzalez & Woods, *Digital Image Processing*, ch. 5; for barcodes, Shellhammer et al. 1999 and Esedoglu 2004).
+
+**Method** (`engine/deblur.js`):
+1. Refine the code's angle to ~0.25° by maximising the edge energy of the averaged profile. The localizer's angle is only good to ~5°, and averaging lines that cross the bars at an angle smears them.
+2. Skip codes that are sharp (edge steepness > 0.36 of the contrast per pixel) or hopeless (< 0.08).
+3. Deconvolve the profile for 18 blur hypotheses: Gaussian σ 1.2–3.4 px (defocus), box length 4–18 px plus σ 0.8 lens blur (motion), in ~15% steps. Weak and strong regularisation (λ 0.0015 / 0.02) alternate between frames: weak suits motion, strong suits noisy, shaky frames.
+4. ZXing reads each restored profile. A frame that yields two different values is dropped. Two hypotheses agreeing count as a strong read. Like the greyscale reader, deblurred values need 3 frames to confirm.
+
+This runs in the second worker, so it adds no time to a frame. The first version (row-averaging a resampled crop) smeared 2 px bars; sampling directly from the frame fixed that.
+
+**Results.** Synthetic clips (`bench/make-clips.py`: 8 sub-frames per exposure, 1280×720, scored by `bench/clip-bench.mjs` with the scanner's pass plan and vote rule; seconds from the code appearing to a confirmed read):
+
+| Clip | Before | After |
+|---|---|---|
+| EAN-13 sweeping 400 px/s (~2 modules of blur) | never (0/37 frames) | 0.50 s (24/37) |
+| EAN-13 sweeping 800 px/s (~4.5 modules) | never (0/37) | 0.43 s (17/37) |
+| EAN-13 sweeping 1200 px/s (~6.7 modules) | never | never |
+| Code 128 sweeping 600 px/s (2 px modules, ~5 modules) | never | 0.97 s (3/37) |
+| EAN-13 focus pull (σ 6 → 0.5 px) | 1.83 s | 1.50 s |
+| Code 128 focus pull (σ 5 → 0.5 px) | 2.17 s | 1.77 s |
+| QR, hand shake | 0.57 s (4/37) | unchanged (2D: not deblurred) |
+| Wrong values | 0 | 0 |
+
+One live box pass on the original 216 frames reads **165/216 (76%), up from 135/216 (62%)**, with 0 wrong:
+
+| Condition | Before | After |
+|---|---|---|
+| EAN-13 / Code 128, heavy blur σ 2.5 | 0/6 / 0/6 | 3/6 / 2/6 |
+| EAN-13 / Code 128, motion 9 px | 0/6 / 0/6 | 3/6 / 3/6 |
+| EAN-13 / Code 128, blur + low contrast + noise | 0/6 / 1/6 | 5/6 / 6/6 |
+| EAN-13 / Code 128, mild blur σ 1.5 | 3/6 / 3/6 | 5/6 / 6/6 |
+| QR / Data Matrix, heavy blur or motion | 0% | 0% |
+
 ## 3. The honest gap
 
-Heavy defocus and motion blur stay at **0%**. That is the core of Scandit's advantage (#1) and can't be fixed by preprocessing before ZXing, because ZXing's first step (black-and-white conversion) destroys the information. Options, in order of value:
+**Updated 2026-11-08:** 1D motion blur and defocus are now partly solved (§2d). What follows applies to 2D codes and to 1D blur beyond ~4 modules.
+
+Heavy defocus and motion blur stay at **0%** for 2D codes. That is the core of Scandit's advantage (#1) and can't be fixed by preprocessing before ZXing, because ZXing's first step (black-and-white conversion) destroys the information. Options, in order of value:
 
 1. **Native engine where available.** On Chrome for Android, `BarcodeDetector` is backed by Google ML Kit, which is much stronger than ZXing on blur. The scanner already uses it automatically in `engine: 'auto'` mode. Only iOS Safari, Firefox and desktop Chrome on Windows/Linux fall back to ZXing.
 2. **ML localization (#2)** plus rectified crops into ZXing, for small, far and angled codes.

@@ -9,11 +9,13 @@ v="${1:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)-$(date +%Y%m%d%H%M
 stamp() { sed -i -E "s#(['\"]\./$2)(\?v=[^'\"]*)?(['\"])#\1?v=${v}\3#g" "$1"; }
 stamp index.html scanner.js
 stamp index.html gs1.js
+stamp replay.html scanner.js
 stamp scanner.js engine/decode-core.js
 stamp scanner.js engine/worker.js
 stamp engine/worker.js decode-core.js
 stamp engine/decode-core.js ean-grey.js
 stamp engine/decode-core.js locate.js
+stamp engine/decode-core.js deblur.js
 stamp scanner.js engine/grey-worker.js
 stamp engine/grey-worker.js decode-core.js
 stamp engine/grey-worker.js ean-grey.js

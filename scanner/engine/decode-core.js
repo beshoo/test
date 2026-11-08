@@ -43,8 +43,9 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
-import { decodeEanGrey } from './ean-grey.js?v=f73d8bf-202611081555';
-import { locateLinear, rectify } from './locate.js?v=f73d8bf-202611081555';
+import { decodeEanGrey } from './ean-grey.js?v=c2abae2-202611081631';
+import { locateLinear, rectify } from './locate.js?v=c2abae2-202611081631';
+import { barProfile, deconvolve, profileImage } from './deblur.js?v=c2abae2-202611081631';
 
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',
@@ -218,6 +219,52 @@ export function createDecoder(readBarcodes) {
     return found;
   }
 
+  /**
+   * Motion blur / defocus: average the located code's lines into one profile,
+   * deconvolve it for each blur hypothesis (engine/deblur.js) and decode the
+   * restored profiles. Two regularisation strengths alternate between frames:
+   * weak suits motion blur, strong suits noisy, shaky frames.
+   */
+  async function deblurLocated(candidates, img, zxFormats, offset, strong) {
+    const out = [];
+    for (const c of candidates.slice(0, 1)) {
+      const { profile, step, angle, steepness } = barProfile(img, c);
+      // Sharp codes (steepness > 0.36) are ZXing's job, and below 0.08 nothing was
+      // recoverable in the clip benchmark: skip both (deblur-only reads: 0.10-0.31).
+      if (steepness > 0.36 || steepness < 0.08) continue;
+      const votes = new Map();
+      for (const d of deconvolve(profile, { step, lambda: strong ? 0.02 : 0.0015 })) {
+        const res = await readBarcodes(profileImage(d.profile), { ...BASE, formats: zxFormats, tryRotate: false, tryDownscale: false, maxNumberOfSymbols: 1 });
+        for (const r of res) {
+          if (!r.isValid) continue;
+          const v = votes.get(r.text) ?? { r, n: 0 };
+          v.n += 1;
+          votes.set(r.text, v);
+        }
+      }
+      // corners of the located code, back in image coordinates
+      const ux = Math.cos(angle), uy = Math.sin(angle), hl = c.len / 2, ht = c.thick / 2;
+      const pts = [[-hl, -ht], [hl, -ht], [hl, ht], [-hl, ht]].map(([a, b]) => ({ x: c.cx + a * ux - b * uy + offset.x, y: c.cy + a * uy + b * ux + offset.y }));
+      const xs = pts.map((q) => q.x), ys = pts.map((q) => q.y);
+      for (const { r, n } of votes.values()) {
+        out.push({
+          rawValue: r.text,
+          format: ZXING_TO_FORMAT[r.format] ?? String(r.format).toLowerCase(),
+          symbologyIdentifier: r.symbologyIdentifier,
+          isGS1: /^\](d2|C1|Q3|e0|J1)/.test(r.symbologyIdentifier || ''),
+          lineCount: n,
+          strong: n >= 2, // two blur hypotheses restored the same value
+          cornerPoints: pts,
+          boundingBox: { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) },
+          strategy: 'deblur',
+        });
+      }
+      if (out.length > 1) return []; // two different values from one code: trust neither
+      if (out.length) return out;
+    }
+    return out;
+  }
+
   /** Greyscale EAN/UPC reader on the located crops (level, so it needs no angle search). */
   function greyLocated(candidates, img, formats) {
     for (const c of candidates) {
@@ -238,8 +285,10 @@ export function createDecoder(readBarcodes) {
    *        search the whole image for 1D codes the old way (ZXing rows).
    * @param {boolean} [opts.greyFallback=fallback] the same for the greyscale reader's angle
    *        fan, which is the slow part (~180 ms on a textured frame without a code).
+   * @param {boolean} [opts.deblur] with `locate`, when no 1D code was read, try to
+   *        restore the strongest located code from motion blur / defocus.
    */
-  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true, tryRotate, locate = false, fallback = true, greyFallback = fallback } = {}) {
+  async function decodeOnce(img, { formats = [], strategy = 0, offset = { x: 0, y: 0 }, greyEan = true, zxing = true, tryRotate, locate = false, fallback = true, greyFallback = fallback, deblur = false } = {}) {
     const s = STRATEGIES[strategy % STRATEGIES.length];
     const wanted = formats.length ? formats : Object.keys(FORMAT_TO_ZXING);
     const linear = wanted.filter((f) => LINEAR_FORMATS.has(f)).map((f) => FORMAT_TO_ZXING[f]);
@@ -282,6 +331,9 @@ export function createDecoder(readBarcodes) {
           strategy: 'greyscale-ean',
         });
       }
+    }
+    if (deblur && candidates.length && !found.some((r) => LINEAR_FORMATS.has(r.format))) {
+      found.push(...(await deblurLocated(candidates, img, linear, offset, strategy % 2 === 1)));
     }
     return found;
   }
