@@ -8,8 +8,8 @@
  *   - 'native' : the browser's Barcode Detection API (Chrome on Android, where it
  *                is backed by Google ML Kit). Fast, but not available on iOS,
  *                Firefox or desktop Chrome on Windows/Linux.
- *   - 'auto'   : native when it exists and supports every requested format,
- *                otherwise zxing.
+ *   - 'auto'   : both at once ("hybrid") where the browser has a native
+ *                detector, otherwise zxing.
  *
  * Camera access needs a secure context: HTTPS, or http://localhost.
  *
@@ -68,9 +68,14 @@ class ZXingWorkerEngine {
   }
 
   /** @param {ImageData} image ownership of image.data.buffer is transferred */
-  decode(image, { formats, strategy, offset, all = false }) {
+  decodeImage(image, { formats, strategy, offset, all = false }) {
     const img = { data: image.data, width: image.width, height: image.height };
     return this._w.call({ image: img, formats, strategy, offset, all }, [image.data.buffer]);
+  }
+
+  /** @param {{canvas, ctx, width, height}} frame */
+  decode(frame, opts) {
+    return this.decodeImage(frame.ctx.getImageData(0, 0, frame.width, frame.height), opts);
   }
 }
 
@@ -85,8 +90,8 @@ class NativeEngine {
     return Promise.resolve();
   }
 
-  async decode(source, { offset = { x: 0, y: 0 } }) {
-    const codes = await this._detector.detect(source);
+  async decode(frame, { offset = { x: 0, y: 0 } } = {}) {
+    const codes = await this._detector.detect(frame.canvas);
     return codes.map((c) => {
       const pts = c.cornerPoints.map((p) => ({ x: p.x + offset.x, y: p.y + offset.y }));
       const b = c.boundingBox;
@@ -103,6 +108,41 @@ class NativeEngine {
   }
 }
 
+/**
+ * Both engines on every frame: Android's ML Kit-backed BarcodeDetector and
+ * ZXing in the worker, in parallel. Whichever reads the code wins. This guards
+ * against devices where BarcodeDetector exists but never returns results.
+ */
+class HybridEngine {
+  constructor(native, zxing) {
+    this.name = 'hybrid';
+    this.native = native;
+    this.zxing = zxing;
+    this.hits = { native: 0, zxing: 0 };
+    this.errors = { native: null, zxing: null };
+  }
+
+  ready() {
+    return this.zxing.ready();
+  }
+
+  async decode(frame, opts) {
+    // Copy pixels for ZXing first: the canvas is not redrawn until both finish.
+    const image = frame.ctx.getImageData(0, 0, frame.width, frame.height);
+    const [n, z] = await Promise.allSettled([this.native.decode(frame, opts), this.zxing.decodeImage(image, opts)]);
+    if (n.status === 'rejected') this.errors.native = String(n.reason?.message || n.reason);
+    if (z.status === 'rejected') this.errors.zxing = String(z.reason?.message || z.reason);
+    if (n.status === 'rejected' && z.status === 'rejected') throw z.reason;
+    const nr = n.status === 'fulfilled' ? n.value : [];
+    const zr = z.status === 'fulfilled' ? z.value : [];
+    if (nr.length) this.hits.native += 1;
+    if (zr.length) this.hits.zxing += 1;
+    const out = [...zr];
+    for (const r of nr) if (!out.some((o) => o.rawValue === r.rawValue)) out.push(r);
+    return out;
+  }
+}
+
 async function nativeSupports(formats) {
   if (typeof globalThis.BarcodeDetector !== 'function') return false;
   try {
@@ -113,13 +153,38 @@ async function nativeSupports(formats) {
   }
 }
 
-/** @param {'auto'|'native'|'zxing'} engine */
+/**
+ * 'auto'   : hybrid (native + ZXing) where the browser has a BarcodeDetector, else ZXing.
+ * 'zxing'  : ZXing only.  'native' : BarcodeDetector only.
+ */
 export async function createEngine(formats = [], engine = 'auto') {
-  if (engine !== 'zxing' && (await nativeSupports(formats))) return new NativeEngine(formats);
-  if (engine === 'native') throw new Error('The native BarcodeDetector is not available for these formats.');
-  const e = new ZXingWorkerEngine();
-  await e.ready();
-  return e;
+  const hasNative = engine !== 'zxing' && (await nativeSupports(formats));
+  if (engine === 'native') {
+    if (!hasNative) throw new Error('The native BarcodeDetector is not available for these formats.');
+    return new NativeEngine(formats);
+  }
+  const z = new ZXingWorkerEngine();
+  await z.ready();
+  return hasNative ? new HybridEngine(new NativeEngine(formats), z) : z;
+}
+
+/**
+ * Pick the main back camera. Asking for facingMode "environment" often gets an
+ * ultra-wide or secondary lens on multi-camera phones, which cannot focus close.
+ *   Android Chrome labels: "camera2 0, facing back" - the lowest number is the main camera.
+ *   iOS Safari labels: "Back Camera", "Back Ultra Wide Camera", "Back Triple Camera", ...
+ *   The virtual multi-lens cameras switch lenses automatically for close-ups.
+ */
+export function chooseBackCamera(devices) {
+  const back = devices.filter((d) => /back|rear|environment/i.test(d.label));
+  if (!back.length) return null;
+  const numbered = back.map((d) => ({ d, n: d.label.match(/camera2?\s*(\d+)/i) })).filter((x) => x.n);
+  if (numbered.length) return numbered.sort((a, b) => Number(a.n[1]) - Number(b.n[1]))[0].d;
+  for (const re of [/triple/i, /dual wide/i, /dual/i, /^back camera$/i]) {
+    const hit = back.find((d) => re.test(d.label));
+    if (hit) return hit;
+  }
+  return back.find((d) => !/ultra|tele|depth|infrared/i.test(d.label)) ?? back[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -142,8 +207,8 @@ export async function scanImage(source, { formats = [], engine = 'auto', maxSize
     canvas.height = Math.round(h0 * scale);
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const input = eng.name === 'native' ? canvas : ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const results = await eng.decode(input, { formats, all: true });
+    const frame = { canvas, ctx, width: canvas.width, height: canvas.height };
+    const results = await eng.decode(frame, { formats, all: true });
     return results.map((r) => scaleResult(r, 1 / scale));
   } finally {
     if (bitmap !== source) bitmap.close?.();
@@ -201,7 +266,9 @@ export class BarcodeScanner {
     this.engine = null;
     this.stream = null;
     this.lastResults = [];
-    this.stats = { frames: 0, decodeMs: 0 };
+    this.stats = { frames: 0, decodeMs: 0 };   // reset by the UI every second
+    this.totals = { attempts: 0, decodeMs: 0, reads: 0 };
+    this.lastError = null;
     this._running = false;
     this._busy = false;
     this._pass = 0;
@@ -238,10 +305,25 @@ export class BarcodeScanner {
     const which = this.options.deviceId
       ? { deviceId: { exact: this.options.deviceId } }
       : { facingMode: { ideal: 'environment' } };
-    this.stream = await navigator.mediaDevices.getUserMedia({
+    const constraints = (w) => ({
       audio: false,
-      video: { ...which, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+      video: { ...w, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
     });
+    this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
+
+    // Labels are only readable after permission: now switch to the main back camera if needed.
+    if (!this.options.deviceId) {
+      try {
+        const best = chooseBackCamera(await BarcodeScanner.listCameras());
+        const current = this.track?.getSettings?.().deviceId;
+        if (best && best.deviceId && best.deviceId !== current) {
+          this.stream.getTracks().forEach((t) => t.stop());
+          this.stream = await navigator.mediaDevices.getUserMedia(constraints({ deviceId: { exact: best.deviceId } }));
+        }
+      } catch {
+        if (!this.stream?.active) this.stream = await navigator.mediaDevices.getUserMedia(constraints(which));
+      }
+    }
 
     // Continuous autofocus where the device allows it.
     const caps = this.capabilities;
@@ -283,6 +365,31 @@ export class BarcodeScanner {
   async setFormats(formats) {
     this.options.formats = formats;
     if (this._running) this.engine = await createEngine(formats, this.options.engine);
+  }
+
+  /** A snapshot of what the scanner is doing, for troubleshooting on a device. */
+  diagnostics() {
+    const t = this.track;
+    const st = t?.getSettings?.() ?? {};
+    const caps = this.capabilities;
+    return {
+      engine: this.engine?.name ?? null,
+      engineHits: this.engine?.hits ?? null,
+      engineErrors: this.engine?.errors ?? null,
+      camera: t?.label ?? null,
+      resolution: st.width ? `${st.width}x${st.height} @ ${Math.round(st.frameRate || 0)}fps` : null,
+      video: this.video.videoWidth ? `${this.video.videoWidth}x${this.video.videoHeight}` : null,
+      focusMode: st.focusMode ?? null,
+      focusModes: caps.focusMode ?? null,
+      zoom: caps.zoom ? `${st.zoom ?? '?'} (${caps.zoom.min}-${caps.zoom.max})` : null,
+      torch: Boolean(caps.torch),
+      attempts: this.totals.attempts,
+      avgDecodeMs: this.totals.attempts ? Math.round(this.totals.decodeMs / this.totals.attempts) : null,
+      reads: this.totals.reads,
+      lastError: this.lastError,
+      formats: this.options.formats,
+      userAgent: navigator.userAgent,
+    };
   }
 
   // --- camera controls ------------------------------------------------------
@@ -401,11 +508,15 @@ export class BarcodeScanner {
       this._ctx.drawImage(video, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, w, h);
 
       const engine = this.engine;
-      const input = engine.name === 'native' ? this._canvas : this._ctx.getImageData(0, 0, w, h);
+      const frame = { canvas: this._canvas, ctx: this._ctx, width: w, height: h };
       const t0 = performance.now();
-      const found = await engine.decode(input, { formats: this.options.formats, strategy: plan.strategy });
+      const found = await engine.decode(frame, { formats: this.options.formats, strategy: plan.strategy });
+      const dt = performance.now() - t0;
       this.stats.frames += 1;
-      this.stats.decodeMs += performance.now() - t0;
+      this.stats.decodeMs += dt;
+      this.totals.attempts += 1;
+      this.totals.decodeMs += dt;
+      if (found.length) this.totals.reads += 1;
       if (!this._running) return;
 
       // Back to video pixel coordinates.
@@ -430,6 +541,7 @@ export class BarcodeScanner {
         if (!this.options.continuous) this.stop();
       }
     } catch (err) {
+      this.lastError = String(err?.message || err);
       this.options.onError(err);
     } finally {
       this._busy = false;
