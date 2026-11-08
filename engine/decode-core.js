@@ -43,7 +43,7 @@ export const FORMAT_TO_ZXING = {
 };
 const ZXING_TO_FORMAT = Object.fromEntries(Object.entries(FORMAT_TO_ZXING).map(([k, v]) => [v, k]));
 
-import { decodeEanGrey } from './ean-grey.js?v=6790fe6-202611080102';
+import { decodeEanGrey } from './ean-grey.js?v=c6f5898-202611080111';
 
 export const LINEAR_FORMATS = new Set([
   'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'codabar', 'itf',
@@ -224,6 +224,8 @@ export function createDecoder(readBarcodes) {
           symbologyIdentifier: g.format === 'ean_8' ? ']E4' : ']E0',
           isGS1: false,
           lineCount: g.lines,
+          crossChecked: Boolean(g.crossChecked),
+          strong: Boolean(g.strong),
           cornerPoints: pts,
           boundingBox: { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) },
           strategy: 'greyscale-ean',
