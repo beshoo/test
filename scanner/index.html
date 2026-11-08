@@ -103,7 +103,10 @@
   <details>
     <summary>Diagnostics</summary>
     <pre id="diag">Start the camera to see what the scanner is doing.</pre>
-    <button id="copyDiag">Copy diagnostics</button>
+    <div class="controls" style="margin:0">
+      <button id="copyDiag">Copy diagnostics</button>
+      <button id="saveFrame">Save camera frame</button>
+    </div>
   </details>
 
   <p id="error" role="alert"></p>
@@ -111,8 +114,8 @@
 </main>
 
 <script type="module">
-  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=ce2af1d-202611080057';
-  import { parseGS1 } from './gs1.js?v=ce2af1d-202611080057';
+  import { BarcodeScanner, COMMON_FORMATS, scanImage } from './scanner.js?v=eb25706-202611080100';
+  import { parseGS1 } from './gs1.js?v=eb25706-202611080100';
 
   const $ = (id) => document.getElementById(id);
   const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
@@ -317,6 +320,15 @@
       const r = document.createRange(); r.selectNodeContents($('diag'));
       const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
     });
+  };
+  $('saveFrame').onclick = async () => {
+    const blob = scanner.running ? await scanner.captureFrame() : null;
+    if (!blob) { showError(new Error('Start the camera first, then point it at the barcode and tap Save camera frame.')); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `scanner-frame-${video.videoWidth}x${video.videoHeight}-${Date.now()}.png`;
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
   $('zoom').oninput = (e) => scanner.setZoom(Number(e.target.value)).catch(showError);
   overlay.onclick = (e) => {

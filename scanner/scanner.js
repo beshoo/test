@@ -17,7 +17,7 @@
  *   const scanner = new BarcodeScanner(video, { formats: ['data_matrix', 'ean_13'], onDetect: (codes) => … });
  *   await scanner.start();
  */
-import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=ce2af1d-202611080057';
+import { LINEAR_FORMATS, STRATEGIES } from './engine/decode-core.js?v=eb25706-202611080100';
 
 /** Formats offered in the UI (both engines understand these names). */
 export const COMMON_FORMATS = [
@@ -68,11 +68,11 @@ class ZXingWorkerEngine {
   constructor() {
     this.name = 'zxing';
     if (!zxingWorker) {
-      zxingWorker = makeWorker(new URL('./engine/worker.js?v=ce2af1d-202611080057', import.meta.url));
+      zxingWorker = makeWorker(new URL('./engine/worker.js?v=eb25706-202611080100', import.meta.url));
       zxingWorker.ready.catch(() => { zxingWorker = null; });
     }
     if (!greyWorker && (navigator.hardwareConcurrency || 1) >= 2) {
-      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=ce2af1d-202611080057', import.meta.url));
+      greyWorker = makeWorker(new URL('./engine/grey-worker.js?v=eb25706-202611080100', import.meta.url));
       greyWorker.ready.catch(() => { greyWorker = null; });
     }
     this._w = zxingWorker;
@@ -185,9 +185,15 @@ class HybridEngine {
   }
 }
 
-/** True when the camera reports continuous or single-shot autofocus (unknown = assume yes). */
+/**
+ * True when the camera has autofocus (unknown = assume yes). Some Android phones
+ * list only "manual" among the focus modes yet report "continuous" as the current
+ * mode, so the current setting counts too.
+ */
 function hasAutofocus(track) {
   const modes = track?.getCapabilities?.().focusMode;
+  const current = track?.getSettings?.().focusMode;
+  if (current === 'continuous' || current === 'single-shot') return true;
   if (!Array.isArray(modes)) return true; // browser does not report focus (e.g. Safari): don't second-guess it
   return modes.includes('continuous') || modes.includes('single-shot');
 }
@@ -325,6 +331,8 @@ export class BarcodeScanner {
     this._fullPasses = 0;
     this._lastRoiHitAt = 0;
     this.firstReadMs = null;
+    this.firstSeenMs = null;
+    this.passStats = { box: { attempts: 0, reads: 0, ms: 0 }, frame: { attempts: 0, reads: 0, ms: 0 } };
     this._startedAt = 0;
     this._lastScanAt = 0;
     this._seen = new Map();    // rawValue -> last reported time
@@ -418,6 +426,8 @@ export class BarcodeScanner {
     this._running = true;
     this._startedAt = performance.now();
     this.firstReadMs = null;
+    this.firstSeenMs = null;
+    this.passStats = { box: { attempts: 0, reads: 0, ms: 0 }, frame: { attempts: 0, reads: 0, ms: 0 } };
     this._seen.clear();
     this._pending.clear();
     this._schedule();
@@ -461,7 +471,10 @@ export class BarcodeScanner {
       engineHits: this.engine?.hits ?? null,
       nativeRetired: this.engine?.nativeOff ?? null,
       parallelWorkers: (this.engine?.zxing ?? this.engine)?.parallel ?? null,
+      firstSeenMs: this.firstSeenMs,
       firstReadMs: this.firstReadMs,
+      passes: Object.fromEntries(Object.entries(this.passStats ?? {}).map(([k, v]) => [k,
+        `${v.reads}/${v.attempts} frames read, ${v.attempts ? Math.round(v.ms / v.attempts) : 0} ms each`])),
       engineErrors: this.engine?.errors ?? null,
       camera: t?.label ?? null,
       resolution: st.width ? `${st.width}x${st.height} @ ${Math.round(st.frameRate || 0)}fps` : null,
@@ -480,6 +493,16 @@ export class BarcodeScanner {
       formats: this.options.formats,
       userAgent: navigator.userAgent,
     };
+  }
+
+  /** The current camera frame at full resolution, as a PNG blob (for troubleshooting). */
+  async captureFrame() {
+    const v = this.video;
+    if (!v.videoWidth) return null;
+    const c = document.createElement('canvas');
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    return new Promise((resolve) => c.toBlob(resolve, 'image/png'));
   }
 
   // --- camera controls ------------------------------------------------------
@@ -611,6 +634,12 @@ export class BarcodeScanner {
       this.totals.attempts += 1;
       this.totals.decodeMs += dt;
       if (found.length) this.totals.reads += 1;
+      const ps = this.passStats[plan.scale === 1 && plan.greyEan ? 'box' : 'frame'];
+      ps.attempts += 1; ps.ms += dt;
+      if (found.length) {
+        ps.reads += 1;
+        if (this.firstSeenMs === null) this.firstSeenMs = Math.round(performance.now() - this._startedAt);
+      }
       if (!this._running) return;
 
       // Back to video pixel coordinates.

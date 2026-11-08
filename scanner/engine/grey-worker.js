@@ -6,8 +6,8 @@
  * Messages in:  { id, type: 'ping' } | { id, image, formats, offset }
  * Messages out: { id, results } | { id, error }
  */
-import { createDecoder } from './decode-core.js?v=ce2af1d-202611080057';
-import { warmUp } from './ean-grey.js?v=ce2af1d-202611080057';
+import { createDecoder } from './decode-core.js?v=eb25706-202611080100';
+import { warmUp } from './ean-grey.js?v=eb25706-202611080100';
 
 const decoder = createDecoder(async () => []); // ZXing is never called here (zxing: false)
 
