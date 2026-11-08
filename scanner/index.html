@@ -62,6 +62,8 @@
     table.gs1 td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
     .ok { color: var(--ok); } .bad { color: var(--warn); }
     .empty { color: var(--muted); font-size: 14px; }
+    #diag { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap;
+      word-break: break-all; margin: 10px 0; max-height: 50vh; overflow: auto; }
   </style>
 </head>
 <body>
@@ -96,6 +98,12 @@
       <label><input type="checkbox" id="forceZxing"> Always use ZXing engine</label>
     </div>
     <p class="sub" style="margin:8px 0 0">Tap the preview to focus. Codes inside the box are decoded at full camera resolution; 1D barcodes must be read in two frames before they are reported.</p>
+  </details>
+
+  <details>
+    <summary>Diagnostics</summary>
+    <pre id="diag">Start the camera to see what the scanner is doing.</pre>
+    <button id="copyDiag">Copy diagnostics</button>
   </details>
 
   <p id="error" role="alert"></p>
@@ -138,6 +146,10 @@
     onError: (err) => showError(err),
   });
 
+  const ENGINE_LABEL = { hybrid: 'Android + ZXing engines', native: 'Android engine', zxing: 'ZXing engine' };
+  const savedCamera = () => { try { return localStorage.getItem('scanner.camera') || ''; } catch { return ''; } };
+  const saveCamera = (id) => { try { localStorage.setItem('scanner.camera', id); } catch { /* storage unavailable */ } };
+
   function showError(err) { $('error').textContent = err ? (err.message || String(err)) : ''; }
 
   async function start() {
@@ -145,11 +157,19 @@
     scanner.options.formats = selectedFormats();
     scanner.options.continuous = $('continuous').checked;
     scanner.options.engine = $('forceZxing').checked ? 'zxing' : 'auto';
+    scanner.options.deviceId = savedCamera() || undefined;
     $('toggle').disabled = true;
     try {
-      await scanner.start();
+      try {
+        await scanner.start();
+      } catch (err) {
+        if (!scanner.options.deviceId || err.name === 'NotAllowedError') throw err;
+        saveCamera(''); // remembered camera is gone: fall back to automatic choice
+        scanner.options.deviceId = undefined;
+        await scanner.start();
+      }
       await fillCameras();
-      $('engine').textContent = scanner.engine.name === 'native' ? 'Native engine' : 'ZXing engine (worker)';
+      $('engine').textContent = ENGINE_LABEL[scanner.engine.name] ?? scanner.engine.name;
       $('engine').hidden = false;
       setupCameraControls();
       $('idle').hidden = true; $('guide').hidden = false;
@@ -203,11 +223,15 @@
   function drawLoop() {
     if (!scanner.running) return;
     const tNow = performance.now();
-    if (tNow - statsAt > 1000 && scanner.stats.frames) {
+    if (tNow - statsAt > 1000) {
       statsAt = tNow;
-      $('stats').textContent = `${(scanner.stats.decodeMs / scanner.stats.frames).toFixed(0)} ms/frame · ${video.videoWidth}×${video.videoHeight}`;
+      const f = scanner.stats.frames;
+      $('stats').textContent = f
+        ? `${f} frames/s · ${(scanner.stats.decodeMs / f).toFixed(0)} ms each · ${video.videoWidth}×${video.videoHeight}`
+        : `waiting for frames · ${video.videoWidth}×${video.videoHeight}`;
       $('stats').hidden = false;
       scanner.stats.frames = 0; scanner.stats.decodeMs = 0;
+      $('diag').textContent = JSON.stringify(scanner.diagnostics(), null, 2);
     }
     const r = overlay.getBoundingClientRect(), dpr = devicePixelRatio || 1;
     if (overlay.width !== Math.round(r.width * dpr)) { overlay.width = Math.round(r.width * dpr); overlay.height = Math.round(r.height * dpr); }
@@ -269,8 +293,16 @@
 
   $('toggle').onclick = () => (scanner.running ? stop() : start());
   $('camera').onchange = async (e) => {
+    saveCamera(e.target.value);
     try { await scanner.switchCamera(e.target.value); setupCameraControls(); drawLoop(); }
     catch (err) { showError(err); syncUi(); }
+  };
+  $('copyDiag').onclick = () => {
+    const text = $('diag').textContent;
+    navigator.clipboard?.writeText(text).catch(() => {
+      const r = document.createRange(); r.selectNodeContents($('diag'));
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    });
   };
   $('zoom').oninput = (e) => scanner.setZoom(Number(e.target.value)).catch(showError);
   overlay.onclick = (e) => {

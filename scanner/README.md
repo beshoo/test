@@ -2,7 +2,7 @@
 
 A browser camera scanner for QR, GS1 Data Matrix, EAN/UPC, Code 128 and more. Everything is self-hosted: no CDN, no license key, and no images leave the device.
 
-- **Engine:** ZXing-C++ compiled to WebAssembly ([zxing-wasm](https://github.com/Sec-ant/zxing-wasm) 3.1.3, MIT; vendored in `vendor/zxing-wasm/`), running in a Web Worker. On Chrome for Android it uses the built-in `BarcodeDetector` (Google ML Kit) automatically.
+- **Engine:** ZXing-C++ compiled to WebAssembly ([zxing-wasm](https://github.com/Sec-ant/zxing-wasm) 3.1.3, MIT; vendored in `vendor/zxing-wasm/`), running in a Web Worker. Where the browser has a built-in `BarcodeDetector` (Chrome on Android: Google ML Kit), both engines run on every frame and the first read wins, so a device whose built-in detector returns nothing still scans.
 - **On top of ZXing:** full-resolution decoding of the target box, a preprocessing/binarizer ladder including sharpening, ghost-read arbitration and two-frame confirmation for 1D codes. On the benchmark this raises read rate from 54% to 64%, with 0 wrong values. Details and sources: [`../docs/scanner-research.md`](../docs/scanner-research.md).
 - **GS1 parsing** (`gs1.js`): GTIN with check-digit validation, expiry/production dates, batch/lot, serial, NHRN, measures.
 
@@ -41,8 +41,8 @@ On a phone, serve the folder over HTTPS (any static host, or a tunnel to your ma
 </script>
 ```
 
-Options: `engine` (`'auto'` | `'zxing'` | `'native'`), `continuous`, `deviceId`, `getRegion()` (target box in video pixels), `confirmLinear` (default 2), `maxDecodeSize` (default 1280), `duplicateTimeoutMs`.
-Methods: `start()`, `stop()`, `switchCamera(id)`, `setFormats(f)`, `setTorch(on)`, `setZoom(v)`, `focusAt(x, y)`, `BarcodeScanner.listCameras()`.
+Options: `engine` (`'auto'` = hybrid where available | `'zxing'` | `'native'`), `continuous`, `deviceId`, `getRegion()` (target box in video pixels), `confirmLinear` (default 2), `maxDecodeSize` (default 1280), `duplicateTimeoutMs`.
+Methods: `diagnostics()`, `start()`, `stop()`, `switchCamera(id)`, `setFormats(f)`, `setTorch(on)`, `setZoom(v)`, `focusAt(x, y)`, `BarcodeScanner.listCameras()`.
 
 Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, boundingBox, strategy }`. GS1 values keep the FNC1 separator as `\x1d`.
 
@@ -57,6 +57,10 @@ Each result has `{ rawValue, format, isGS1, symbologyIdentifier, cornerPoints, b
 | `index.html` | Demo UI |
 | `vendor/zxing-wasm/` | Vendored zxing-wasm 3.1.3 reader (+ `.wasm`, SHA-256 `2ebda08a…c6d1ba`), MIT |
 | `bench/` | Benchmark: `make-codes.mjs` → `make-frames.py` → `bench.mjs` |
+
+## Camera choice
+
+On multi-camera phones, `facingMode: "environment"` often opens an ultra-wide or secondary lens that can't focus up close. After permission is granted, `start()` switches to the main back camera (`chooseBackCamera()`: lowest-numbered `camera2 N, facing back` on Android; Triple, then Dual Wide, then Back Camera on iOS). The demo remembers a camera picked by hand.
 
 ## Known limits
 
